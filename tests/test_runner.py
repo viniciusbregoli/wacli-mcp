@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -65,13 +66,25 @@ async def test_nonzero_exit_without_envelope(fake):
 
 
 async def test_timeout_kills_child(fake):
-    fake.scenario(sleep=30)
+    fake.scenario(sleep=30, child=True)
     runner = WacliRunner(fake.config(timeout_s=1.0))
     started = time.monotonic()
     with pytest.raises(WacliError) as info:
         await runner.run(["doctor"])
     assert info.value.kind == "timeout"
     assert time.monotonic() - started < 10
+    # The whole process group goes, like wacli under the unshare wrapper, not only the direct child.
+    pid = int((fake.home / "child.pid").read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("a descendant of wacli survived the timeout")
 
 
 async def test_output_cap(fake):
