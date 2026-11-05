@@ -51,3 +51,19 @@ def test_browser_origin_is_rejected(client):
     headers = {**HEADERS, "authorization": f"Bearer {TOKEN}", "origin": "http://evil.example"}
     response = client.post("/mcp", json=INIT, headers=headers)
     assert response.status_code == 403
+
+
+def test_localhost_is_accepted_on_a_loopback_listener(client):
+    headers = {**HEADERS, "authorization": f"Bearer {TOKEN}", "host": "localhost:8765"}
+    response = client.post("/mcp", json=INIT, headers=headers)
+    assert response.status_code == 200
+
+
+def test_localhost_is_not_added_for_a_tailnet_listener(fake):
+    http = HttpConfig(host="100.100.1.2", port=8765, token=TOKEN)
+    app = build_http_app(build_server(fake.config()), http)
+    with TestClient(app, base_url="http://100.100.1.2:8765") as c:
+        headers = {**HEADERS, "authorization": f"Bearer {TOKEN}", "host": "localhost:8765"}
+        assert c.post("/mcp", json=INIT, headers=headers).status_code in (400, 421)
+        headers["host"] = "100.100.1.2:8765"
+        assert c.post("/mcp", json=INIT, headers=headers).status_code == 200

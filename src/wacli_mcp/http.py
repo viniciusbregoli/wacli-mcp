@@ -8,6 +8,7 @@ loopback or Tailscale addresses (enforced in HttpConfig).
 from __future__ import annotations
 
 import hmac
+import ipaddress
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -56,6 +57,9 @@ def _host_header(host: str, port: int) -> str:
 
 def build_http_app(server: MCPServer, http: HttpConfig) -> ASGIApp:
     hosts = [_host_header(http.host, http.port)] + [f"{name}:{http.port}" for name in http.allowed_hostnames]
+    if ipaddress.ip_address(http.host).is_loopback:
+        # `localhost` can only reach a loopback listener, so it adds no rebinding exposure.
+        hosts.append(f"localhost:{http.port}")
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=hosts,
