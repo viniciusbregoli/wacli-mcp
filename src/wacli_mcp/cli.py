@@ -25,14 +25,17 @@ def _store_label(view: Config) -> str:
 def _check(cfg: Config) -> int:
     """Validate the configuration and run a local `doctor` per account (no WhatsApp connection)."""
     runner = WacliRunner(cfg)
+
+    async def doctor_all() -> list[tuple[Config, object]]:
+        return [(view, await runner.run(["doctor"], target=view)) for view in cfg.account_views()]
+
+    try:
+        results = asyncio.run(doctor_all())
+    except WacliError as exc:
+        print(f"wacli doctor failed: {exc}", file=sys.stderr)
+        return 1
     reports = []
-    for view in cfg.account_views():
-        try:
-            data = asyncio.run(runner.run(["doctor"], target=view))
-        except WacliError as exc:
-            where = f" for account {view.alias}" if cfg.multi_account else ""
-            print(f"wacli doctor failed{where}: {exc}", file=sys.stderr)
-            return 1
+    for view, data in results:
         report = {"store": _store_label(view), **shape_doctor(data, view)}
         if cfg.multi_account:
             report = {"account": view.alias, **({"label": view.label} if view.label else {}), **report}
