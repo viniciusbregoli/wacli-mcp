@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -151,3 +152,44 @@ def build_real_store(root: Path) -> tuple[Path, Path]:
     db.commit()
     db.close()
     return home, store
+
+
+FAKE_DAEMON = Path(__file__).with_name("fake_daemon.py")
+DAEMON_REPLY = {"ok": True, "sent": True, "to": ADA, "id": "3EB0FAKEMESSAGEID"}
+
+
+class FakeDaemon:
+    """Runs tests/fake_daemon.py against a store directory; see that file for the protocol."""
+
+    def __init__(self, store: Path, reply: dict | None = None) -> None:
+        self.store = store
+        self.proc = subprocess.Popen(
+            [sys.executable, "-I", str(FAKE_DAEMON), str(store), json.dumps(reply or DAEMON_REPLY)],
+            stdin=subprocess.DEVNULL,
+        )
+        ready = store / "daemon-ready"
+        for _ in range(200):
+            if ready.exists():
+                return
+            if self.proc.poll() is not None:
+                raise RuntimeError("fake daemon exited during startup")
+            time.sleep(0.025)
+        self.stop()
+        raise RuntimeError("fake daemon did not start")
+
+    def requests(self) -> list[dict]:
+        path = self.store / "delegate-requests.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def stop(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=10)
+        for name in (".send.sock", "daemon-ready"):
+            (self.store / name).unlink(missing_ok=True)
+
+
+@pytest.fixture
+def daemon(fake):
+    running = FakeDaemon(fake.home)
+    yield running
+    running.stop()

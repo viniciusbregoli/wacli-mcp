@@ -140,3 +140,55 @@ async def test_stdio_entry_point_end_to_end(store):
         result = await client.call_tool("search_messages", {"query": "invoice"})
     assert "search_messages" in tools and "send_message" not in tools
     assert {m["msg_id"] for m in result.structured_content["messages"]} == {"M1", "M2"}
+
+
+async def test_send_is_delegated_to_the_sync_daemon_from_an_offline_sandbox(tmp_path_factory):
+    """Real wacli, run with no network at all, hands the send to a fake `sync --follow` daemon."""
+    from conftest import DAEMON_REPLY, FakeDaemon
+    from mcp.types import ElicitResult
+
+    home, store_dir = build_real_store(tmp_path_factory.mktemp("s"))
+    db = store_dir / "wacli.db"
+    before = (db.stat().st_mtime_ns, db.stat().st_size)
+    prompts = []
+
+    async def user(context, params):
+        prompts.append(params.message)
+        return ElicitResult(action="accept", content={"approve": True})
+
+    text = "dinner at 8?\n-- sent from the archive assistant"
+    daemon = FakeDaemon(store_dir)
+    try:
+        cfg = make_config(
+            (home, store_dir),
+            WACLI_MCP_ENABLE_SEND="1",
+            WACLI_MCP_SEND_RECIPIENTS=f"ada={ADA}",
+        )
+        assert cfg.network_isolated
+        async with Client(build_server(cfg), elicitation_callback=user) as client:
+            result = await client.call_tool("send_message", {"recipient": "ada", "text": text})
+        requests = daemon.requests()
+    finally:
+        daemon.stop()
+
+    assert not result.is_error, result.content
+    assert result.structured_content["sent"] is True
+    assert result.structured_content["message_id"] == DAEMON_REPLY["id"]
+    assert len(prompts) == 1 and text in prompts[0]
+    (request,) = requests
+    assert request["kind"] == "text"
+    assert request["to"] == ADA
+    assert request["message"] == text
+    assert request["no_preview"] is True
+    assert not request.get("allow_self") and not request.get("mentions") and not request.get("reply_to")
+    # The delegated path never opens the archive for writing.
+    assert (db.stat().st_mtime_ns, db.stat().st_size) == before
+
+
+async def test_send_without_daemon_never_runs_wacli(tmp_path_factory):
+    home, store_dir = build_real_store(tmp_path_factory.mktemp("n"))
+    cfg = make_config((home, store_dir), WACLI_MCP_ENABLE_SEND="1", WACLI_MCP_SEND_RECIPIENTS=f"ada={ADA}")
+    async with Client(build_server(cfg), elicitation_callback=None) as client:
+        result = await client.call_tool("send_message", {"recipient": "ada", "text": "hi"})
+    assert result.is_error and "wacli sync --follow" in result.content[0].text
+    assert sorted(p.name for p in store_dir.iterdir()) == ["wacli.db"]
