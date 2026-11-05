@@ -131,8 +131,11 @@ def shape_messages(data: Any, cfg) -> dict[str, Any]:
     result: dict[str, Any] = envelope(
         messages=[project_message(m, cfg.max_text_chars) for m in visible],
         hidden_by_policy=len(rows) - len(visible),
-        page={"has_more": bool(page.get("has_more")), "next_cursor": page.get("next_cursor")},
-        last_sync_at=source.get("last_sync_at"),
+        page={
+            "has_more": bool(page.get("has_more")),
+            "next_cursor": _clean(page.get("next_cursor"), cfg.max_text_chars),
+        },
+        last_sync_at=_clean(source.get("last_sync_at"), cfg.max_text_chars),
     )
     if "context" in data:
         groups = []
@@ -141,8 +144,9 @@ def shape_messages(data: Any, cfg) -> dict[str, Any]:
                 continue
             groups.append(
                 {
-                    "chat_jid": group.get("chat_jid"),
-                    "hit_msg_id": group.get("msg_id"),
+                    # Message ids are chosen by the sender's client, so they get the same cleaning as text.
+                    "chat_jid": _clean(group.get("chat_jid"), cfg.max_text_chars),
+                    "hit_msg_id": _clean(group.get("msg_id"), cfg.max_text_chars),
                     "messages": [
                         project_message(m, cfg.max_text_chars)
                         for m in group.get("messages") or []

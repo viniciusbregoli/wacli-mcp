@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -120,3 +121,19 @@ def test_cursor_and_query():
         validation.query_text("   ")
     with pytest.raises(ToolError):
         validation.query_text("q" * 201)
+
+
+def test_ids_cursor_and_sync_time_are_sanitized():
+    bidi = chr(0x202E)
+    cfg = Config(wacli_bin=Path("/bin/true"), home=Path("/"))
+    out = shape_messages(
+        {
+            "messages": [],
+            "context": [{"chat_jid": "1@s.whatsapp.net", "msg_id": "ID" + bidi + "evil", "messages": []}],
+            "page": {"has_more": True, "next_cursor": "c" + bidi},
+            "source": {"last_sync_at": "2026" + bidi},
+        },
+        cfg,
+    )
+    assert bidi not in json.dumps(out, ensure_ascii=False)
+    assert out["context"][0]["hit_msg_id"] == "IDevil"
