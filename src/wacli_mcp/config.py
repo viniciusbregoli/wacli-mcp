@@ -24,6 +24,10 @@ NetworkIsolation = Literal["require", "auto", "off"]
 
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 JID_RE = re.compile(r"^[0-9A-Za-z._:+-]{1,64}@(s\.whatsapp\.net|g\.us|lid|newsletter|broadcast|c\.us)$")
+# Sending is limited to people and groups. Channels, status and broadcast lists are excluded.
+SEND_JID_RE = re.compile(r"^[0-9]{5,20}(-[0-9]{5,20})?@(s\.whatsapp\.net|g\.us|lid)$")
+ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+SendConfirmation = Literal["elicit", "none"]
 
 # Tailscale hands out addresses from these ranges. Binding the HTTP transport
 # anywhere else (LAN, 0.0.0.0) is refused so the endpoint stays local or tailnet-only.
@@ -72,6 +76,38 @@ def _jid_set(env: Mapping[str, str], key: str) -> frozenset[str]:
         if not JID_RE.match(item):
             raise ConfigError(f"{key} entries must be full JIDs (for example 15551234567@s.whatsapp.net), got {item!r}")
     return frozenset(items)
+
+
+def _flag(env: Mapping[str, str], key: str) -> bool:
+    raw = env.get(key, "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    raise ConfigError(f"{key} must be 1 or 0")
+
+
+def _recipients(raw: str) -> tuple[tuple[str, str], ...]:
+    pairs: list[tuple[str, str]] = []
+    for item in (part.strip() for part in raw.split(",")):
+        if not item:
+            continue
+        alias, sep, jid = item.partition("=")
+        alias, jid = alias.strip(), jid.strip()
+        if not sep or not ALIAS_RE.match(alias):
+            raise ConfigError(
+                f"WACLI_MCP_SEND_RECIPIENTS entries must be alias=JID with a lowercase alias, got {item!r}"
+            )
+        if not SEND_JID_RE.match(jid):
+            raise ConfigError(f"send recipient {alias!r} must be a person or group JID, got {jid!r}")
+        if any(alias == a or jid == j for a, j in pairs):
+            raise ConfigError(f"duplicate send recipient {alias!r} or {jid!r}")
+        pairs.append((alias, jid))
+    return tuple(pairs)
+
+
+def _chat_allowed(jid: str, allowed: frozenset[str], denied: frozenset[str]) -> bool:
+    return jid not in denied and (not allowed or jid in allowed)
 
 
 def _check_not_writable_by_others(path: Path, what: str) -> os.stat_result:
@@ -137,10 +173,24 @@ class Config:
     # Command prefix that puts every wacli call in an empty network namespace.
     # Empty tuple means no isolation.
     sandbox_prefix: tuple[str, ...] = ()
+    # Sending (off unless WACLI_MCP_ENABLE_SEND=1 and recipients are configured).
+    send_enabled: bool = False
+    send_recipients: tuple[tuple[str, str], ...] = ()  # (alias, JID) pairs
+    send_confirmation: SendConfirmation = "elicit"
+    send_max_chars: int = 1000
+    send_per_hour: int = 10
+    send_timeout_s: float = 60.0
 
     @property
     def network_isolated(self) -> bool:
         return bool(self.sandbox_prefix)
+
+    def send_recipient(self, value: str) -> tuple[str, str] | None:
+        """Resolve an alias or JID to an allowlisted (alias, JID) pair."""
+        for alias, jid in self.send_recipients:
+            if value in (alias, jid):
+                return alias, jid
+        return None
 
     def chat_visible(self, jid: str | None) -> bool:
         if not jid:
@@ -226,6 +276,21 @@ class Config:
                     "set WACLI_MCP_NETWORK_ISOLATION=auto or off to run without it"
                 )
 
+        send_enabled = _flag(env, "WACLI_MCP_ENABLE_SEND")
+        send_recipients = _recipients(env.get("WACLI_MCP_SEND_RECIPIENTS", ""))
+        if send_enabled:
+            if not send_recipients:
+                raise ConfigError("WACLI_MCP_ENABLE_SEND=1 requires WACLI_MCP_SEND_RECIPIENTS (alias=JID pairs)")
+            if store_dir is None:
+                # The running sync daemon is found through its store directory.
+                raise ConfigError("sending requires WACLI_MCP_STORE (the store that `wacli sync --follow` uses)")
+            blocked = [jid for _, jid in send_recipients if not _chat_allowed(jid, allowed, denied)]
+            if blocked:
+                raise ConfigError(f"send recipients hidden by the chat policy: {', '.join(blocked)}")
+        confirmation = env.get("WACLI_MCP_SEND_CONFIRMATION", "elicit").strip().lower() or "elicit"
+        if confirmation not in ("elicit", "none"):
+            raise ConfigError("WACLI_MCP_SEND_CONFIRMATION must be elicit or none")
+
         return cls(
             wacli_bin=wacli_bin,
             home=home,
@@ -240,6 +305,12 @@ class Config:
             denied_chats=denied,
             audit_log=audit_log,
             sandbox_prefix=sandbox_prefix,
+            send_enabled=send_enabled,
+            send_recipients=send_recipients,
+            send_confirmation=confirmation,  # type: ignore[arg-type]
+            send_max_chars=_int(env, "WACLI_MCP_SEND_MAX_CHARS", 1000, 1, 4096),
+            send_per_hour=_int(env, "WACLI_MCP_SEND_PER_HOUR", 10, 1, 60),
+            send_timeout_s=_float(env, "WACLI_MCP_SEND_TIMEOUT_S", 60.0, 10.0, 300.0),
         )
 
 
