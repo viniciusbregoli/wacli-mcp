@@ -30,6 +30,11 @@ FAKE_WACLI = textwrap.dedent(
             sc = json.load(fh)
     except FileNotFoundError:
         sc = {{}}
+    if sc.get("child"):
+        import subprocess
+        child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+        with open(os.path.join(home, "child.pid"), "w") as fh:
+            fh.write(str(child.pid))
     if sc.get("sleep"):
         time.sleep(sc["sleep"])
     if sc.get("big"):
