@@ -47,6 +47,8 @@ ALLOWED_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
 )
 
 audit_logger = logging.getLogger("wacli_mcp.audit")
+# Records go only to the private audit file, never up to the stderr handler.
+audit_logger.propagate = False
 
 
 def configure_audit_log(path: Path | None) -> None:

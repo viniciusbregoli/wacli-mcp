@@ -123,3 +123,9 @@ async def test_audit_log_is_private_and_has_no_arguments(fake, tmp_path):
     assert "very-private-term" not in text
     entry = json.loads(text.splitlines()[-1])
     assert entry["tool"] == "search_messages" and entry["ok"] is True and entry["count"] == 2
+
+
+def test_audit_records_do_not_reach_stderr():
+    from wacli_mcp.server import audit_logger
+
+    assert audit_logger.propagate is False
