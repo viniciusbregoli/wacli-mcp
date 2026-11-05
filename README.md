@@ -41,6 +41,9 @@ With sending enabled (see [Sending](#sending)) one more tool appears:
 
 It carries `readOnlyHint: false`, `idempotentHint: false` and `openWorldHint: true`.
 
+With several accounts configured (see [Multiple accounts](#multiple-accounts)), every tool takes a required
+`account` argument limited to the configured aliases. With one account, tool signatures are unchanged.
+
 ## Security model
 
 Read-only access still exposes private conversations, and a model that reads attacker-controlled text can be
@@ -114,6 +117,7 @@ All settings are environment variables read once at startup. None can be changed
 | `WACLI_MCP_MAX_TEXT_CHARS` | `4000` | Truncation length for each text field |
 | `WACLI_MCP_AUDIT_LOG` | unset | Absolute path of the JSON-lines audit log |
 | `WACLI_MCP_HOME` | `$HOME` | `HOME` passed to wacli |
+| `WACLI_MCP_ACCOUNTS_FILE` | unset | TOML file defining several accounts (see [Multiple accounts](#multiple-accounts)) |
 
 Sending only (see [Sending](#sending)):
 
@@ -140,6 +144,60 @@ Policy notes: with an allowlist, explicit `chat` filters must be exact JIDs, bec
 wacli. wacli may return rows for a chat's `@lid` identity when you ask for its phone-number JID, so list both forms
 if you use an allowlist. Rows are filtered after wacli applies `limit`, so a page can come back shorter than
 requested; `hidden_by_policy` reports how many rows were removed.
+
+## Multiple accounts
+
+One server can serve several WhatsApp accounts, each a separate wacli store. Point `WACLI_MCP_ACCOUNTS_FILE` at a
+TOML file (owned by you, mode 600) with one table per account; [deploy/accounts.example.toml](deploy/accounts.example.toml)
+is a starting point:
+
+```toml
+[accounts.personal]
+store = "/home/me/.local/state/wacli"   # an existing store, by absolute path
+label = "Personal phone"
+denied_chats = ["15550000002@s.whatsapp.net"]
+
+[accounts.personal.send]                # optional, needs WACLI_MCP_ENABLE_SEND=1
+recipients = { me = "15550000001@s.whatsapp.net" }
+
+[accounts.work]
+wacli_account = "work"                  # a named wacli account
+allowed_chats = ["120363000000000001@g.us"]
+```
+
+| Key | Meaning |
+| --- | --- |
+| `store` | Absolute store directory. Exactly one of `store` or `wacli_account` |
+| `wacli_account` | A name from `wacli accounts list` |
+| `label` | Optional text shown to the model next to the alias |
+| `allowed_chats`, `denied_chats` | This account's chat policy (lists of JIDs) |
+| `send.recipients` | This account's only possible recipients, `alias = "JID"` |
+
+How accounts are kept apart:
+
+- **Explicit selection.** Every tool requires `account`, an enum of the aliases. There is no default account, so a
+  call can never land on an archive the model did not name.
+- **Pinned stores.** `wacli_account` names are resolved once at startup with `wacli accounts show` (read-only,
+  inside the empty network namespace) and every call then uses `--store=<that directory>`. Changing wacli's
+  `config.yaml` or default account later cannot redirect an alias; restart the server to pick up changes. Two
+  aliases on the same store are refused.
+- **Per-account policy.** Chat allowlists and denylists, send recipients, the hourly send limit, the duplicate
+  guard and the sync daemon check all belong to one account. A recipient alias or JID configured for one
+  account is refused when sending from another.
+- **Two switches for sending.** The file says who each account may message, and `WACLI_MCP_ENABLE_SEND=1` in the
+  environment turns sending on. `send_message` only lists accounts that have recipients.
+- **Labelled results and audit.** Results and audit entries carry the account alias.
+
+`WACLI_MCP_STORE`, `WACLI_MCP_ACCOUNT`, `WACLI_MCP_ALLOWED_CHATS`, `WACLI_MCP_DENIED_CHATS` and
+`WACLI_MCP_SEND_RECIPIENTS` cannot be combined with the file; everything else (limits, audit log, isolation, send
+confirmation) still comes from the environment and applies to all accounts. The global per-minute rate limit and
+concurrency cap are shared, while send limits are per account. Each account needs its own
+`wacli --store=<dir> sync --follow` running for fresh data and for sending.
+
+Adding a second wacli account without breaking the first: `wacli accounts add <name>` makes the first account it
+adds the **default**, so every wacli command run without `--store` or `--account` (including a single-account
+wacli-mcp without `WACLI_MCP_STORE`) switches to the new, empty store. Pin the existing archive by absolute path,
+as in the example above, before adding accounts; `wacli-mcp check` warns when a single-account setup is unpinned.
 
 ## Connecting a client
 

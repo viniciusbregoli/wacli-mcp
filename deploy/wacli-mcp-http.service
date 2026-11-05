@@ -26,6 +26,10 @@ Environment=WACLI_MCP_AUDIT_LOG=/home/CHANGE_ME_USER/.local/state/wacli-mcp/audi
 #Environment=WACLI_MCP_STORE=/home/CHANGE_ME_USER/.local/state/wacli
 #Environment=WACLI_MCP_ENABLE_SEND=1
 #Environment=WACLI_MCP_SEND_RECIPIENTS=me=CHANGE_ME_JID
+# Several accounts instead (see README, Multiple accounts): replaces
+# WACLI_MCP_STORE and WACLI_MCP_SEND_RECIPIENTS above. Add every store to
+# ReadWritePaths below.
+#Environment=WACLI_MCP_ACCOUNTS_FILE=/home/CHANGE_ME_USER/.config/wacli-mcp/accounts.toml
 UMask=0077
 Restart=on-failure
 RestartSec=10
