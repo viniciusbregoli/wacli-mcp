@@ -34,8 +34,10 @@ ProtectSystem=strict
 ProtectHome=read-only
 # The wacli store must be writable only for SQLite's shared-memory file when
 # `wacli sync --follow` keeps the database in WAL mode; wacli itself runs with
-# --read-only and WACLI_READONLY=1.
-ReadWritePaths=/home/CHANGE_ME_USER/.local/state/wacli /home/CHANGE_ME_USER/.local/state/wacli-mcp
+# --read-only and WACLI_READONLY=1. Point the first path at your actual store
+# (older installs use ~/.wacli); the leading "-" lets the unit start if it is
+# absent. The audit log directory is required.
+ReadWritePaths=-/home/CHANGE_ME_USER/.local/state/wacli /home/CHANGE_ME_USER/.local/state/wacli-mcp
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
