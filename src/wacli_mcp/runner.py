@@ -64,17 +64,22 @@ class WacliRunner:
         # One send at a time, so confirmations and outcomes map one to one.
         self._write_lock = asyncio.Lock()
 
-    def build_argv(self, args: Sequence[str], *, write: bool = False) -> list[str]:
+    def build_argv(self, args: Sequence[str], *, write: bool = False, target: Config | None = None) -> list[str]:
+        """Build the argv for one call. `target` is the account view to run against (default: the server's)."""
         cfg = self.cfg
+        selector = target or cfg
         argv = [*cfg.sandbox_prefix, str(cfg.wacli_bin)]
         if write:
             argv += ["--json", f"--timeout={int(cfg.send_timeout_s)}s"]
         else:
             argv += ["--read-only", "--json", f"--timeout={int(cfg.timeout_s)}s"]
-        if cfg.store_dir is not None:
-            argv.append(f"--store={cfg.store_dir}")
-        elif cfg.account is not None:
-            argv.append(f"--account={cfg.account}")
+        if selector.store_dir is not None:
+            argv.append(f"--store={selector.store_dir}")
+        elif selector.account is not None:
+            argv.append(f"--account={selector.account}")
+        elif cfg.multi_account:
+            # Never fall back to wacli's default store when several accounts are configured.
+            raise WacliError("no store selected for this call", kind="config")
         argv.extend(args)
         return argv
 
@@ -92,21 +97,22 @@ class WacliRunner:
                 env[key] = os.environ[key]
         return env
 
-    async def run(self, args: Sequence[str]) -> Any:
+    async def run(self, args: Sequence[str], target: Config | None = None) -> Any:
         """Run one wacli read command and return the `data` field of its JSON envelope."""
         self._limiter.check()
+        argv = self.build_argv(args, target=target)
         async with self._sem:
-            stdout, stderr, returncode = await self._spawn(self.build_argv(args), self.build_env(), self.cfg.timeout_s)
+            stdout, stderr, returncode = await self._spawn(argv, self.build_env(), self.cfg.timeout_s)
         return self._parse(stdout, stderr, returncode)
 
-    async def run_write(self, args: Sequence[str]) -> Any:
+    async def run_write(self, args: Sequence[str], target: Config | None = None) -> Any:
         """Run one wacli write command. Callers own authorization, confirmation and rate limits.
 
         Never retried: a send that timed out may still have been delivered.
         """
         async with self._write_lock:
             stdout, stderr, returncode = await self._spawn(
-                self.build_argv(args, write=True), self.build_env(write=True), self.cfg.send_timeout_s
+                self.build_argv(args, write=True, target=target), self.build_env(write=True), self.cfg.send_timeout_s
             )
         return self._parse(stdout, stderr, returncode)
 
