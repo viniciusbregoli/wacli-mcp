@@ -423,7 +423,10 @@ def resolve_wacli_account(name: str, base: Config, env: Mapping[str, str]) -> Pa
         envelope = json.loads(result.stdout.decode("utf-8", errors="replace") or "{}")
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         raise ConfigError(f"could not resolve wacli account {name!r}: {exc}") from exc
-    data = envelope.get("data") if isinstance(envelope, dict) else None
+    if not isinstance(envelope, dict):
+        # `null`, a list or a scalar: not wacli's JSON envelope (a wrapper script or the wrong binary).
+        raise ConfigError(f"could not resolve wacli account {name!r}: unexpected reply from wacli")
+    data = envelope.get("data")
     if result.returncode != 0 or not envelope.get("success") or not isinstance(data, dict):
         error = str(envelope.get("error") or f"wacli exited with status {result.returncode}")[:300]
         raise ConfigError(f"could not resolve wacli account {name!r}: {error}")

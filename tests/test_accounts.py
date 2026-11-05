@@ -189,10 +189,13 @@ def test_wacli_account_is_resolved_once_and_pinned(fake, tmp_path, stores):
         {"success": False, "data": None, "error": 'account "work" is not configured'},
         {"success": True, "data": {"name": "other", "store_dir": "/tmp"}, "error": None},
         {"success": True, "data": {"name": "work"}, "error": None},
+        None,
+        [],
+        "ok",
     ],
 )
 def test_wacli_account_resolution_failures_are_config_errors(fake, tmp_path, reply):
-    fake.scenario(stdout=json.dumps(reply), rc=0 if reply["success"] else 1)
+    fake.scenario(stdout=json.dumps(reply), rc=0 if isinstance(reply, dict) and reply["success"] else 1)
     path = write_accounts(tmp_path, '[accounts.work]\nwacli_account = "work"\n')
     with pytest.raises(ConfigError, match="wacli account"):
         Config.from_env(env_for(fake, path))
