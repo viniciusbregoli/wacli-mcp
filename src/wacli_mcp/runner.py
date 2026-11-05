@@ -31,18 +31,27 @@ class WacliError(Exception):
 
 
 class RateLimiter:
-    """Sliding one-minute window. Bounds how fast a misbehaving agent can page through the archive."""
+    """Sliding window. Bounds how fast a misbehaving agent can page through the archive or send."""
 
-    def __init__(self, per_minute: int, clock=time.monotonic) -> None:
-        self._per_minute = per_minute
+    def __init__(self, limit: int, window_s: float = 60.0, clock=time.monotonic) -> None:
+        self._limit = limit
+        self._window_s = window_s
         self._clock = clock
         self._calls: deque[float] = deque()
 
-    def check(self) -> None:
+    def _expire(self) -> float:
         now = self._clock()
-        while self._calls and now - self._calls[0] >= 60.0:
+        while self._calls and now - self._calls[0] >= self._window_s:
             self._calls.popleft()
-        if len(self._calls) >= self._per_minute:
+        return now
+
+    def would_allow(self) -> bool:
+        self._expire()
+        return len(self._calls) < self._limit
+
+    def check(self) -> None:
+        now = self._expire()
+        if len(self._calls) >= self._limit:
             raise WacliError("rate limit exceeded; wait before calling again", kind="rate_limit")
         self._calls.append(now)
 
@@ -52,10 +61,16 @@ class WacliRunner:
         self.cfg = cfg
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
         self._limiter = RateLimiter(cfg.rate_limit_per_minute)
+        # One send at a time, so confirmations and outcomes map one to one.
+        self._write_lock = asyncio.Lock()
 
-    def build_argv(self, args: Sequence[str]) -> list[str]:
+    def build_argv(self, args: Sequence[str], *, write: bool = False) -> list[str]:
         cfg = self.cfg
-        argv = [*cfg.sandbox_prefix, str(cfg.wacli_bin), "--read-only", "--json", f"--timeout={int(cfg.timeout_s)}s"]
+        argv = [*cfg.sandbox_prefix, str(cfg.wacli_bin)]
+        if write:
+            argv += ["--json", f"--timeout={int(cfg.send_timeout_s)}s"]
+        else:
+            argv += ["--read-only", "--json", f"--timeout={int(cfg.timeout_s)}s"]
         if cfg.store_dir is not None:
             argv.append(f"--store={cfg.store_dir}")
         elif cfg.account is not None:
@@ -63,14 +78,15 @@ class WacliRunner:
         argv.extend(args)
         return argv
 
-    def build_env(self) -> dict[str, str]:
+    def build_env(self, *, write: bool = False) -> dict[str, str]:
         env = {
             "HOME": str(self.cfg.home),
             "PATH": "/usr/bin:/bin",
             "LANG": "C.UTF-8",
-            # Belt and braces: wacli also refuses writes when this is set.
-            "WACLI_READONLY": "1",
         }
+        if not write:
+            # Belt and braces: wacli also refuses writes when this is set.
+            env["WACLI_READONLY"] = "1"
         for key in PASSTHROUGH_ENV:
             if key in os.environ:
                 env[key] = os.environ[key]
@@ -80,17 +96,28 @@ class WacliRunner:
         """Run one wacli read command and return the `data` field of its JSON envelope."""
         self._limiter.check()
         async with self._sem:
-            stdout, stderr, returncode = await self._spawn(self.build_argv(args))
+            stdout, stderr, returncode = await self._spawn(self.build_argv(args), self.build_env(), self.cfg.timeout_s)
         return self._parse(stdout, stderr, returncode)
 
-    async def _spawn(self, argv: list[str]) -> tuple[bytes, bytes, int]:
+    async def run_write(self, args: Sequence[str]) -> Any:
+        """Run one wacli write command. Callers own authorization, confirmation and rate limits.
+
+        Never retried: a send that timed out may still have been delivered.
+        """
+        async with self._write_lock:
+            stdout, stderr, returncode = await self._spawn(
+                self.build_argv(args, write=True), self.build_env(write=True), self.cfg.send_timeout_s
+            )
+        return self._parse(stdout, stderr, returncode)
+
+    async def _spawn(self, argv: list[str], env: dict[str, str], timeout_s: float) -> tuple[bytes, bytes, int]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=self.build_env(),
+                env=env,
                 cwd="/",
                 # Own process group, so a timeout can kill wacli together with the unshare wrapper.
                 start_new_session=True,
@@ -110,11 +137,11 @@ class WacliRunner:
             _read_capped(proc.stderr, MAX_STDERR_BYTES),
         )
         try:
-            async with asyncio.timeout(self.cfg.timeout_s + 2.0):
+            async with asyncio.timeout(timeout_s + 2.0):
                 stdout, stderr = await readers
                 returncode = await proc.wait()
         except TimeoutError as exc:
-            raise WacliError(f"wacli did not finish within {self.cfg.timeout_s:g}s", kind="timeout") from exc
+            raise WacliError(f"wacli did not finish within {timeout_s:g}s", kind="timeout") from exc
         finally:
             if proc.returncode is None:
                 _kill_group(proc.pid)
