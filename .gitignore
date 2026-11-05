@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Never commit WhatsApp data, session keys, tokens, or audit logs.
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+*.token
+token
+.env
