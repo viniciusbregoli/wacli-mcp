@@ -1,0 +1,142 @@
+"""End-to-end tests with the real wacli binary.
+
+Each test builds a throwaway store in a temp directory, never touches the
+owner's store, and runs every wacli call inside an empty network namespace,
+so nothing can reach WhatsApp.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from conftest import ADA, BIDI_OVERRIDE, BOOK_CLUB, REAL_WACLI, SECRET, build_real_store, unshare_works
+from mcp import Client
+
+from wacli_mcp.config import Config
+from wacli_mcp.server import build_server
+
+pytestmark = [
+    pytest.mark.anyio,
+    pytest.mark.integration,
+    pytest.mark.skipif(not REAL_WACLI.exists(), reason="wacli binary not installed"),
+    pytest.mark.skipif(not unshare_works(), reason="unprivileged user namespaces unavailable"),
+]
+
+
+@pytest.fixture(scope="module")
+def store(tmp_path_factory):
+    return build_real_store(tmp_path_factory.mktemp("wacli-real"))
+
+
+def make_config(store, **extra) -> Config:
+    home, store_dir = store
+    env = {
+        "WACLI_MCP_HOME": str(home),
+        "WACLI_MCP_BIN": str(REAL_WACLI),
+        "WACLI_MCP_STORE": str(store_dir),
+        "WACLI_MCP_NETWORK_ISOLATION": "require",
+        **extra,
+    }
+    return Config.from_env(env)
+
+
+async def call(cfg, tool, args=None):
+    async with Client(build_server(cfg)) as client:
+        return await client.call_tool(tool, args or {})
+
+
+async def test_health_reports_isolated_unauthenticated_store(store):
+    result = await call(make_config(store), "archive_health")
+    data = result.structured_content
+    assert not result.is_error
+    assert data["authenticated"] is False
+    assert data["store_counts"] == {"messages": 4, "chats": 3, "contacts": 2, "groups": 0}
+    assert data["mcp_policy"]["network_isolated"] is True
+
+
+async def test_search_with_context_and_sanitized_injection(store):
+    result = await call(make_config(store), "search_messages", {"query": "invoice", "context_before": 1})
+    data = result.structured_content
+    assert {m["msg_id"] for m in data["messages"]} == {"M1", "M2", "S1"}
+    assert data["context"]
+    injection = await call(make_config(store), "search_messages", {"query": "instructions"})
+    (msg,) = injection.structured_content["messages"]
+    assert msg["chat_jid"] == BOOK_CLUB
+    assert BIDI_OVERRIDE not in msg["text"]
+    assert injection.structured_content["untrusted_content"] is True
+
+
+async def test_deny_list_hides_secret_chat_everywhere(store):
+    cfg = make_config(store, WACLI_MCP_DENIED_CHATS=SECRET)
+    search = (await call(cfg, "search_messages", {"query": "secret"})).structured_content
+    assert search["messages"] == [] and search["hidden_by_policy"] == 1
+    chats = (await call(cfg, "list_chats")).structured_content
+    assert SECRET not in [c["jid"] for c in chats["items"]]
+    contacts = (await call(cfg, "search_contacts", {"query": "Secret"})).structured_content
+    assert contacts["items"] == []
+    coverage = (await call(cfg, "history_coverage")).structured_content
+    assert SECRET not in json.dumps(coverage)
+
+
+async def test_allowlist_limits_to_one_chat(store):
+    cfg = make_config(store, WACLI_MCP_ALLOWED_CHATS=ADA)
+    listing = (await call(cfg, "list_messages", {"chat": ADA, "oldest_first": True})).structured_content
+    assert [m["msg_id"] for m in listing["messages"]] == ["M1", "M2"]
+    recent = (await call(cfg, "list_messages")).structured_content
+    assert {m["chat_jid"] for m in recent["messages"]} == {ADA}
+
+
+async def test_flag_like_query_is_treated_as_text(store):
+    result = await call(make_config(store), "search_messages", {"query": "--limit"})
+    assert not result.is_error
+    assert result.structured_content["messages"] == []
+
+
+async def test_unknown_chat_name_is_a_clean_error(store):
+    result = await call(make_config(store), "list_messages", {"chat": "nobody"})
+    assert result.is_error
+    assert "no local exact name match" in result.content[0].text
+
+
+async def test_pagination_cursor_round_trip(store):
+    cfg = make_config(store)
+    first = (await call(cfg, "list_messages", {"limit": 2})).structured_content
+    assert first["page"]["has_more"] is True
+    second = (await call(cfg, "list_messages", {"limit": 2, "cursor": first["page"]["next_cursor"]})).structured_content
+    ids = [m["msg_id"] for m in first["messages"] + second["messages"]]
+    assert sorted(ids) == ["G1", "M1", "M2", "S1"]
+
+
+async def test_store_is_not_modified_by_reads(store):
+    _, store_dir = store
+    db = store_dir / "wacli.db"
+    before = (db.stat().st_mtime_ns, db.stat().st_size)
+    cfg = make_config(store)
+    for tool, args in [("list_chats", {}), ("search_messages", {"query": "invoice"}), ("archive_health", {})]:
+        assert not (await call(cfg, tool, args)).is_error
+    assert (db.stat().st_mtime_ns, db.stat().st_size) == before
+
+
+async def test_stdio_entry_point_end_to_end(store):
+    """Spawns the real `wacli-mcp` CLI as an MCP client would."""
+    import sys
+
+    from mcp import StdioServerParameters
+
+    home, store_dir = store
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "wacli_mcp", "stdio"],
+        env={
+            "WACLI_MCP_HOME": str(home),
+            "WACLI_MCP_BIN": str(REAL_WACLI),
+            "WACLI_MCP_STORE": str(store_dir),
+            "WACLI_MCP_DENIED_CHATS": SECRET,
+        },
+    )
+    async with Client(params) as client:
+        tools = {t.name for t in (await client.list_tools()).tools}
+        result = await client.call_tool("search_messages", {"query": "invoice"})
+    assert "search_messages" in tools and "send_message" not in tools
+    assert {m["msg_id"] for m in result.structured_content["messages"]} == {"M1", "M2"}
