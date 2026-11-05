@@ -6,7 +6,7 @@
 #   install -m 0644 deploy/wacli-mcp-http.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now wacli-mcp-http
 [Unit]
-Description=wacli read-only MCP server (Streamable HTTP, tailnet only)
+Description=wacli MCP server (Streamable HTTP, tailnet only)
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
@@ -21,6 +21,11 @@ Environment=WACLI_MCP_HTTP_PORT=8765
 Environment=WACLI_MCP_ALLOWED_HOSTNAMES=CHANGE_ME_HOSTNAME
 Environment=WACLI_MCP_TOKEN_FILE=/home/CHANGE_ME_USER/.config/wacli-mcp/token
 Environment=WACLI_MCP_AUDIT_LOG=/home/CHANGE_ME_USER/.local/state/wacli-mcp/audit.jsonl
+# Optional sending (see README, Sending). Needs `wacli sync --follow` running
+# for this store; prefer a stdio client with elicitation over HTTP for sends.
+#Environment=WACLI_MCP_STORE=/home/CHANGE_ME_USER/.local/state/wacli
+#Environment=WACLI_MCP_ENABLE_SEND=1
+#Environment=WACLI_MCP_SEND_RECIPIENTS=me=CHANGE_ME_JID
 UMask=0077
 Restart=on-failure
 RestartSec=10
@@ -34,9 +39,10 @@ ProtectSystem=strict
 ProtectHome=read-only
 # The wacli store must be writable only for SQLite's shared-memory file when
 # `wacli sync --follow` keeps the database in WAL mode; wacli itself runs with
-# --read-only and WACLI_READONLY=1. Point the first path at your actual store
-# (older installs use ~/.wacli); the leading "-" lets the unit start if it is
-# absent. The audit log directory is required.
+# --read-only and WACLI_READONLY=1 for reads. Sends also connect to the
+# daemon's .send.sock in that directory. Point the first path at your actual
+# store (older installs use ~/.wacli); the leading "-" lets the unit start if
+# it is absent. The audit log directory is required.
 ReadWritePaths=-/home/CHANGE_ME_USER/.local/state/wacli /home/CHANGE_ME_USER/.local/state/wacli-mcp
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

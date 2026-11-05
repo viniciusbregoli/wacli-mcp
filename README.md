@@ -1,11 +1,12 @@
 # wacli-mcp
 
-A read-only [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant search and
-read a WhatsApp archive mirrored locally by [wacli](https://github.com/openclaw/wacli).
+A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant search and read a
+WhatsApp archive mirrored locally by [wacli](https://github.com/openclaw/wacli), and, only if you opt in, send plain
+text to a short list of recipients you name.
 
-It cannot send, edit, delete, react, mark as read, download media, back-fill history, or link an account. Those
-code paths do not exist here. Keeping the archive current is left to `wacli sync --follow`, running as a separate
-process you control.
+By default it is read-only. It never edits, deletes, reacts, marks as read, downloads media, back-fills history,
+or links an account; those code paths do not exist here. Keeping the archive current, and owning the WhatsApp
+connection, is left to `wacli sync --follow`, running as a separate process you control.
 
 The design follows the MCP guidance in wacli's own
 [companion integrations guide](https://github.com/openclaw/wacli/blob/main/docs/integrations.md#model-context-protocol-mcp):
@@ -32,19 +33,29 @@ instead of using whatsmeow directly, and what was evaluated.
 Every tool carries `readOnlyHint: true` and `openWorldHint: false`. Results are wrapped with
 `untrusted_content: true` and a notice telling the model not to follow instructions found in messages.
 
+With sending enabled (see [Sending](#sending)) one more tool appears:
+
+| Tool | wacli command |
+| --- | --- |
+| `send_message` | `send text --to=<configured JID> --message=<text> --no-preview`, delegated to `wacli sync --follow` |
+
+It carries `readOnlyHint: false`, `idempotentHint: false` and `openWorldHint: true`.
+
 ## Security model
 
 Read-only access still exposes private conversations, and a model that reads attacker-controlled text can be
 steered by it ([Invariant Labs showed exactly this against a WhatsApp MCP server](https://invariantlabs.ai/blog/whatsapp-mcp-exploited)).
 The layers, from outside in:
 
-1. **No write tools.** The exfiltration path in the Invariant Labs research was a `send_message` tool. There is none
-   here. Pair this server with other tools that can send data out (email, web requests, shell) only with care,
-   since a prompt injection read through this server could use them.
+1. **No write tools by default.** The exfiltration path in the Invariant Labs research was a `send_message` tool.
+   It does not exist unless you enable it, and then only reaches recipients you listed (see [Sending](#sending)).
+   Pair this server with other tools that can send data out (email, web requests, shell) only with care, since a
+   prompt injection read through this server could use them.
 2. **No network for wacli.** By default every wacli call runs inside an empty network namespace
    (`unshare -rn`), so even a bug in a read path cannot talk to WhatsApp. The server refuses to start if that is
    unavailable, unless you set `WACLI_MCP_NETWORK_ISOLATION=auto` or `off`.
-3. **wacli read-only mode.** Every call passes `--read-only` and `WACLI_READONLY=1`.
+3. **wacli read-only mode.** Every read call passes `--read-only` and `WACLI_READONLY=1`. The one exception is
+   `send_message`, which still runs without network and can only hand a message to the sync daemon.
 4. **Fixed command shape.** The executable, store or account, and command allowlist are set by the operator.
    Arguments are single `--flag=value` tokens, free text goes after `--`, there is no shell, and the child gets a
    minimal environment (your API keys and tokens are not inherited).
@@ -104,6 +115,18 @@ All settings are environment variables read once at startup. None can be changed
 | `WACLI_MCP_AUDIT_LOG` | unset | Absolute path of the JSON-lines audit log |
 | `WACLI_MCP_HOME` | `$HOME` | `HOME` passed to wacli |
 
+Sending only (see [Sending](#sending)):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WACLI_MCP_ENABLE_SEND` | unset | `1` registers `send_message`; requires the two settings below |
+| `WACLI_MCP_SEND_RECIPIENTS` | unset | Comma-separated `alias=JID` pairs, the only possible recipients |
+| `WACLI_MCP_STORE` | | Required with sending, so the daemon check looks at the right store |
+| `WACLI_MCP_SEND_CONFIRMATION` | `elicit` | `elicit` asks the user to approve each message; `none` skips that |
+| `WACLI_MCP_SEND_MAX_CHARS` | `1000` | Longest message accepted (1 to 4096) |
+| `WACLI_MCP_SEND_PER_HOUR` | `10` | Sends per rolling hour (1 to 60) |
+| `WACLI_MCP_SEND_TIMEOUT_S` | `60` | Time allowed for one send (10 to 300) |
+
 HTTP transport only:
 
 | Variable | Default | Meaning |
@@ -154,11 +177,55 @@ Clients connect to `http://<tailscale-ip>:8765/mcp` with `Authorization: Bearer 
 inside the Tailscale tunnel, which WireGuard already encrypts. A hardened systemd unit is in
 [deploy/wacli-mcp-http.service](deploy/wacli-mcp-http.service).
 
+## Sending
+
+Sending is off unless you set `WACLI_MCP_ENABLE_SEND=1`. It exists for one job: letting an assistant send a short
+text you asked for to someone you named in advance. It is the one capability that can move data out of the
+archive, so a message passes all of these, in order, before wacli is run:
+
+1. **Recipient allowlist.** `recipient` must be an alias from `WACLI_MCP_SEND_RECIPIENTS` or one of its exact
+   JIDs. Names, phone numbers and other JIDs are refused, so a model (or a message it read) cannot pick a new
+   destination. Recipients must also be visible under the chat policy, or the server will not start.
+2. **Message checks.** Plain text up to `WACLI_MCP_SEND_MAX_CHARS`. Text with control or invisible characters
+   (bidi overrides, zero-width spaces) is refused rather than cleaned, so what you approve is exactly what is sent.
+   Lines starting with `-----` are refused because the confirmation prompt uses that frame.
+3. **Rate and duplicates.** At most `WACLI_MCP_SEND_PER_HOUR` sends per hour, one at a time, and the same text to
+   the same recipient is refused for 10 minutes.
+4. **Daemon check.** The server confirms that `wacli sync --follow` holds the store lock and its `.send.sock`
+   exists. wacli then hands the message to that daemon over the Unix socket; the wacli child still runs in the
+   empty network namespace. Without the daemon nothing is run, so this server never opens a second WhatsApp
+   connection.
+5. **User confirmation.** With the default `WACLI_MCP_SEND_CONFIRMATION=elicit`, the client shows the user the
+   recipient and the exact text (MCP elicitation) and nothing is sent unless they approve. Clients without
+   elicitation support get an error and nothing is sent.
+
+Outcomes are reported honestly. If wacli times out or says the message may still have gone through, the tool
+says the outcome is unknown, tells the model not to retry, and blocks the same text for 10 minutes. The audit log
+records the recipient alias, character count and outcome of every attempt, including refused ones, and never the
+text.
+
+`WACLI_MCP_SEND_CONFIRMATION=none` removes step 5. Use it only for a client without elicitation, with a recipient
+list you would be comfortable with a prompt injection writing to (for example, only yourself): anything the model
+reads can then influence what it sends to those recipients.
+
+Example, sending only to your own number and one group:
+
+```sh
+claude mcp add whatsapp --scope user \
+  --env WACLI_MCP_STORE="$HOME/.local/state/wacli" \
+  --env WACLI_MCP_ENABLE_SEND=1 \
+  --env WACLI_MCP_SEND_RECIPIENTS="me=15551234567@s.whatsapp.net,family=120363000000000000@g.us" \
+  --env WACLI_MCP_AUDIT_LOG="$HOME/.local/state/wacli-mcp/audit.jsonl" \
+  -- wacli-mcp stdio
+```
+
+`archive_health` reports `send_ready: true` once the daemon is running for that store.
+
 ## Keeping the archive fresh
 
-This server only reads. Results describe what wacli has stored; message results (`list_messages`,
+This server never syncs. Results describe what wacli has stored; message results (`list_messages`,
 `search_messages`) and `archive_health` include `last_sync_at`, which says when a sync last completed. Run the
-sync yourself, for example as a service:
+sync yourself, for example as a service (sending also needs it running):
 
 ```sh
 wacli sync --follow
@@ -173,7 +240,10 @@ wacli's read commands work while `sync --follow` holds the store lock.
   should never leave the machine.
 - wacli's JSON fields are not a formal API. Integration tests pin the behaviour of the tested version; run them
   after upgrading wacli.
-- Media is not available: there is no download tool, by design.
+- Media is not available: there is no download tool, by design. Sending is plain text only: no files, replies,
+  mentions or link previews.
+- Delivery is not confirmed. A successful `send_message` means WhatsApp accepted the message, not that the
+  recipient's phone received it.
 
 ## Development
 
