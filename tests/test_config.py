@@ -76,6 +76,29 @@ def test_audit_log_directory_must_exist(fake, tmp_path):
         Config.from_env(env_for(fake, WACLI_MCP_AUDIT_LOG=str(tmp_path / "missing" / "audit.jsonl")))
 
 
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o602])
+def test_existing_audit_log_must_be_private(fake, tmp_path, mode):
+    log = tmp_path / "audit.jsonl"
+    log.write_text("")
+    log.chmod(mode)
+    with pytest.raises(ConfigError, match="chmod 600"):
+        Config.from_env(env_for(fake, WACLI_MCP_AUDIT_LOG=str(log)))
+    log.chmod(0o600)
+    assert Config.from_env(env_for(fake, WACLI_MCP_AUDIT_LOG=str(log))).audit_log == log
+
+
+def test_audit_log_must_not_be_a_symlink(fake, tmp_path):
+    target = tmp_path / "elsewhere.jsonl"
+    target.write_text("")
+    target.chmod(0o600)
+    (tmp_path / "audit.jsonl").symlink_to(target)
+    with pytest.raises(ConfigError, match="regular file"):
+        Config.from_env(env_for(fake, WACLI_MCP_AUDIT_LOG=str(tmp_path / "audit.jsonl")))
+    target.unlink()
+    with pytest.raises(ConfigError, match="regular file"):
+        Config.from_env(env_for(fake, WACLI_MCP_AUDIT_LOG=str(tmp_path / "audit.jsonl")))
+
+
 def test_limits_are_bounded(fake):
     with pytest.raises(ConfigError, match="between"):
         Config.from_env(env_for(fake, WACLI_MCP_TIMEOUT_S="9999"))

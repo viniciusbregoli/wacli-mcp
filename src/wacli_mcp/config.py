@@ -197,6 +197,14 @@ class Config:
             raise ConfigError("WACLI_MCP_AUDIT_LOG must be absolute")
         if audit_log and not audit_log.parent.is_dir():
             raise ConfigError(f"directory for WACLI_MCP_AUDIT_LOG does not exist: {audit_log.parent}")
+        if audit_log and os.path.lexists(audit_log):
+            # The 0600 mode only applies when the file is created; an existing file keeps its own.
+            st = audit_log.lstat()
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+                raise ConfigError(
+                    f"{audit_log} must be a regular file owned by the current user and not accessible "
+                    "by group or others (chmod 600)"
+                )
 
         mode = env.get("WACLI_MCP_NETWORK_ISOLATION", "require").strip().lower() or "require"
         if mode not in ("require", "auto", "off"):
