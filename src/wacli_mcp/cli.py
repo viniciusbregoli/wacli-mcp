@@ -14,26 +14,38 @@ from .server import build_server
 from .shaping import shape_doctor
 
 
+def _store_label(view: Config) -> str:
+    if view.store_dir:
+        return str(view.store_dir)
+    if view.account:
+        return f"account:{view.account}"
+    return "wacli default (follows wacli's default_account; set WACLI_MCP_STORE to pin it)"
+
+
 def _check(cfg: Config) -> int:
-    """Validate the configuration and run a local `doctor` (no WhatsApp connection)."""
-    try:
-        data = asyncio.run(WacliRunner(cfg).run(["doctor"]))
-    except WacliError as exc:
-        print(f"wacli doctor failed: {exc}", file=sys.stderr)
-        return 1
-    report = {
-        "wacli_bin": str(cfg.wacli_bin),
-        "store": str(cfg.store_dir)
-        if cfg.store_dir
-        else (f"account:{cfg.account}" if cfg.account else "wacli default"),
-        **shape_doctor(data, cfg),
-    }
-    print(json.dumps(report, indent=2))
+    """Validate the configuration and run a local `doctor` per account (no WhatsApp connection)."""
+    runner = WacliRunner(cfg)
+    reports = []
+    for view in cfg.account_views():
+        try:
+            data = asyncio.run(runner.run(["doctor"], target=view))
+        except WacliError as exc:
+            where = f" for account {view.alias}" if cfg.multi_account else ""
+            print(f"wacli doctor failed{where}: {exc}", file=sys.stderr)
+            return 1
+        report = {"store": _store_label(view), **shape_doctor(data, view)}
+        if cfg.multi_account:
+            report = {"account": view.alias, **({"label": view.label} if view.label else {}), **report}
+        reports.append(report)
+    if cfg.multi_account:
+        print(json.dumps({"wacli_bin": str(cfg.wacli_bin), "accounts": reports}, indent=2))
+    else:
+        print(json.dumps({"wacli_bin": str(cfg.wacli_bin), **reports[0]}, indent=2))
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="wacli-mcp", description="Read-only MCP server over a local wacli store.")
+    parser = argparse.ArgumentParser(prog="wacli-mcp", description="MCP server over local wacli stores.")
     parser.add_argument("mode", nargs="?", choices=["stdio", "http", "check"], default="stdio")
     args = parser.parse_args(argv)
 
@@ -49,6 +61,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not cfg.network_isolated:
         logging.warning("network isolation is off: wacli children can reach the network")
+    if not cfg.multi_account and cfg.store_dir is None and cfg.account is None:
+        logging.warning(
+            "no store pinned: wacli picks its default store, which changes if a default account is added; "
+            "set WACLI_MCP_STORE"
+        )
 
     if args.mode == "check":
         return _check(cfg)
