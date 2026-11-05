@@ -477,6 +477,9 @@ def load_accounts_file(
             if not isinstance(name, str) or not WACLI_ACCOUNT_RE.match(name):
                 raise ConfigError(f"{where}.wacli_account is not a valid wacli account name")
             store_dir = resolve(name, base, env)
+            if not store_dir.is_absolute():
+                # A relative path would be checked here against one directory and used by wacli from another.
+                raise ConfigError(f"wacli returned a relative store path for account {alias!r}")
         if not store_dir.is_dir():
             raise ConfigError(f"store for account {alias!r} does not exist: {store_dir}")
         real = store_dir.resolve()
