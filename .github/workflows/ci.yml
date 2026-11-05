@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WACLI_VERSION: "0.25.1"
+  # sha256 of wacli_0.25.1_linux_amd64.tar.gz from the release's checksums.txt.
+  WACLI_SHA256: "53bbb450f0a47e3b080173d61fd6cec72241d8065bee17e592275983b7abd281"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Install pinned wacli release
+        run: |
+          mkdir -p "$RUNNER_TEMP/wacli"
+          cd "$RUNNER_TEMP/wacli"
+          curl -fsSLo wacli.tar.gz "https://github.com/openclaw/wacli/releases/download/v${WACLI_VERSION}/wacli_${WACLI_VERSION}_linux_amd64.tar.gz"
+          echo "${WACLI_SHA256}  wacli.tar.gz" | sha256sum -c -
+          tar -xzf wacli.tar.gz
+          install -m 0755 "$(find . -type f -name wacli | head -n1)" "$RUNNER_TEMP/wacli/bin-wacli"
+          echo "WACLI_MCP_TEST_BIN=$RUNNER_TEMP/wacli/bin-wacli" >> "$GITHUB_ENV"
+
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts them through AppArmor; the integration tests run
+        # wacli inside `unshare -rn` so it has no network at all.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Test
+        run: uv run pytest -v -p no:cacheprovider
