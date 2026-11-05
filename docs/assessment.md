@@ -64,8 +64,11 @@ lharries/whatsapp-mcp pairs a small whatsmeow bridge with a Python MCP server ex
   to an attacker ([write-up](https://invariantlabs.ai/blog/whatsapp-mcp-exploited),
   [Simon Willison's summary](https://simonwillison.net/2025/Apr/9/mcp-prompt-injection/),
   [Docker's analysis](https://www.docker.com/blog/mcp-horror-stories-whatsapp-data-exfiltration-issue/)). The
-  target was lharries/whatsapp-mcp. Removing send tools closes that channel inside this server; the residual risk
-  is other egress-capable tools in the same agent session.
+  target was lharries/whatsapp-mcp. This server ships without a send tool by default. Its optional
+  `send_message` narrows that channel instead of closing it: an operator-defined recipient allowlist, per-message
+  user confirmation by default, refusal of invisible characters, rate and duplicate limits, and delegation to
+  the separately run sync daemon. The residual risks are a user approving a message they did not read, the
+  `none` confirmation mode, and other egress-capable tools in the same agent session.
 - **Upstream guidance.** wacli documents how an MCP wrapper should be built: fixed store, small allowlist of read
   commands, no shell, bounded inputs and outputs, untrusted-content handling, private logs, and no send, delete,
   account or backfill commands ([integrations guide](https://github.com/openclaw/wacli/blob/main/docs/integrations.md#model-context-protocol-mcp)).
@@ -84,7 +87,8 @@ lharries/whatsapp-mcp pairs a small whatsmeow bridge with a Python MCP server ex
 - **Account risk.** Every option here uses the unofficial protocol. WhatsApp's help center says unofficial apps
   violate its terms and that linking an account to them may lead to a temporary or permanent ban
   ([temporarily banned accounts](https://faq.whatsapp.com/1848531392146538), [account bans](https://faq.whatsapp.com/465883178708358)).
-  Read-only use with a single linked device and no automated sending keeps the footprint small, but the risk is not
+  Read-only use with a single linked device and little or no automated sending keeps the footprint small (the
+  send rate limit defaults to 10 per hour), but the risk is not
   zero and cannot be removed by this project. The official WhatsApp Business Platform cannot read a personal
   account's chats, so it does not fit this use case.
 - **Data at rest.** Both wacli databases are unencrypted SQLite files protected by file permissions (wacli creates

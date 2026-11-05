@@ -1,0 +1,20 @@
+# Example WACLI_MCP_ACCOUNTS_FILE. Copy it, keep it mode 600, and replace the
+# synthetic JIDs and paths. Aliases are what the assistant passes as `account`.
+
+# The archive wacli already has, by absolute path. This is how an unnamed
+# store (wacli's default directory) is kept exactly where it is.
+[accounts.personal]
+store = "/home/CHANGE_ME_USER/.local/state/wacli"
+label = "Personal phone"
+denied_chats = ["15550000002@s.whatsapp.net"]
+
+# Optional: who this account may message. Ignored unless WACLI_MCP_ENABLE_SEND=1.
+[accounts.personal.send]
+recipients = { me = "15550000001@s.whatsapp.net" }
+
+# A named wacli account (`wacli accounts add work`), resolved once at startup
+# with `wacli accounts show work` and pinned to that store.
+[accounts.work]
+wacli_account = "work"
+label = "Work phone"
+allowed_chats = ["120363000000000001@g.us"]

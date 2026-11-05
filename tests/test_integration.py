@@ -8,6 +8,7 @@ so nothing can reach WhatsApp.
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 from conftest import ADA, BIDI_OVERRIDE, BOOK_CLUB, REAL_WACLI, SECRET, build_real_store, unshare_works
@@ -140,3 +141,112 @@ async def test_stdio_entry_point_end_to_end(store):
         result = await client.call_tool("search_messages", {"query": "invoice"})
     assert "search_messages" in tools and "send_message" not in tools
     assert {m["msg_id"] for m in result.structured_content["messages"]} == {"M1", "M2"}
+
+
+async def test_send_is_delegated_to_the_sync_daemon_from_an_offline_sandbox(tmp_path_factory):
+    """Real wacli, run with no network at all, hands the send to a fake `sync --follow` daemon."""
+    from conftest import DAEMON_REPLY, FakeDaemon
+    from mcp.types import ElicitResult
+
+    home, store_dir = build_real_store(tmp_path_factory.mktemp("s"))
+    db = store_dir / "wacli.db"
+    before = (db.stat().st_mtime_ns, db.stat().st_size)
+    prompts = []
+
+    async def user(context, params):
+        prompts.append(params.message)
+        return ElicitResult(action="accept", content={"approve": True})
+
+    text = "dinner at 8?\n-- sent from the archive assistant"
+    daemon = FakeDaemon(store_dir)
+    try:
+        cfg = make_config(
+            (home, store_dir),
+            WACLI_MCP_ENABLE_SEND="1",
+            WACLI_MCP_SEND_RECIPIENTS=f"ada={ADA}",
+        )
+        assert cfg.network_isolated
+        async with Client(build_server(cfg), elicitation_callback=user) as client:
+            result = await client.call_tool("send_message", {"recipient": "ada", "text": text})
+        requests = daemon.requests()
+    finally:
+        daemon.stop()
+
+    assert not result.is_error, result.content
+    assert result.structured_content["sent"] is True
+    assert result.structured_content["message_id"] == DAEMON_REPLY["id"]
+    assert len(prompts) == 1 and text in prompts[0]
+    (request,) = requests
+    assert request["kind"] == "text"
+    assert request["to"] == ADA
+    assert request["message"] == text
+    assert request["no_preview"] is True
+    assert not request.get("allow_self") and not request.get("mentions") and not request.get("reply_to")
+    # The delegated path never opens the archive for writing.
+    assert (db.stat().st_mtime_ns, db.stat().st_size) == before
+
+
+async def test_send_without_daemon_never_runs_wacli(tmp_path_factory):
+    home, store_dir = build_real_store(tmp_path_factory.mktemp("n"))
+    cfg = make_config((home, store_dir), WACLI_MCP_ENABLE_SEND="1", WACLI_MCP_SEND_RECIPIENTS=f"ada={ADA}")
+    async with Client(build_server(cfg), elicitation_callback=None) as client:
+        result = await client.call_tool("send_message", {"recipient": "ada", "text": "hi"})
+    assert result.is_error and "wacli sync --follow" in result.content[0].text
+    assert sorted(p.name for p in store_dir.iterdir()) == ["wacli.db"]
+
+
+@pytest.fixture(scope="module")
+def two_accounts(tmp_path_factory):
+    """Two real stores registered as named wacli accounts in a synthetic wacli config.yaml.
+
+    `personal` keeps Ada and the book club; `work` keeps only the secret chat.
+    wacli's default account is `work`, so a fallback to wacli's default would show up.
+    """
+    root = tmp_path_factory.mktemp("wacli-accounts")
+    stores = {}
+    for name, drop in (("personal", [SECRET]), ("work", [ADA, BOOK_CLUB])):
+        (root / name).mkdir()
+        home, store = build_real_store(root / name)
+        db = sqlite3.connect(store / "wacli.db")
+        for jid in drop:
+            for table, column in (("messages", "chat_jid"), ("chats", "jid"), ("contacts", "jid")):
+                db.execute(f"DELETE FROM {table} WHERE {column} = ?", (jid,))  # noqa: S608
+        db.commit()
+        db.close()
+        stores[name] = (home, store)
+    state = root / "state"
+    (state / "wacli").mkdir(parents=True, mode=0o700)
+    (state / "wacli" / "config.yaml").write_text(
+        "default_account: work\naccounts:\n"
+        + "".join(f"  {name}:\n    store: {store}\n" for name, (_, store) in stores.items())
+    )
+    accounts_file = root / "accounts.toml"
+    accounts_file.write_text(
+        '[accounts.personal]\nwacli_account = "personal"\n\n[accounts.work]\nwacli_account = "work"\n'
+        f'denied_chats = ["{BOOK_CLUB}"]\n'
+    )
+    accounts_file.chmod(0o600)
+    env = {
+        "WACLI_MCP_HOME": str(stores["personal"][0]),
+        "WACLI_MCP_BIN": str(REAL_WACLI),
+        "WACLI_MCP_NETWORK_ISOLATION": "require",
+        "XDG_STATE_HOME": str(state),
+        "WACLI_MCP_ACCOUNTS_FILE": str(accounts_file),
+    }
+    return env, {name: store for name, (_, store) in stores.items()}
+
+
+async def test_named_wacli_accounts_resolve_and_stay_isolated(two_accounts):
+    env, stores = two_accounts
+    cfg = Config.from_env(env)
+    assert {v.alias: v.store_dir for v in cfg.account_views()} == stores
+
+    personal = await call(cfg, "search_messages", {"account": "personal", "query": "invoice"})
+    work = await call(cfg, "search_messages", {"account": "work", "query": "invoice"})
+    assert {m["chat_jid"] for m in personal.structured_content["messages"]} == {ADA}
+    assert {m["chat_jid"] for m in work.structured_content["messages"]} == {SECRET}
+
+    health = await call(cfg, "archive_health", {"account": "personal"})
+    assert health.structured_content["store_counts"]["chats"] == 2
+    missing = await call(cfg, "archive_health", {})
+    assert missing.is_error

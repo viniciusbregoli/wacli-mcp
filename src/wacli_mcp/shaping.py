@@ -181,5 +181,15 @@ def shape_doctor(data: Any, cfg) -> dict[str, Any]:
             "chat_allowlist_active": bool(cfg.allowed_chats),
             "denied_chat_count": len(cfg.denied_chats),
             "rate_limit_per_minute": cfg.rate_limit_per_minute,
+            "send_enabled": cfg.send_enabled,
+            **(
+                {
+                    "send_recipients": [alias for alias, _ in cfg.send_recipients],
+                    "send_confirmation": cfg.send_confirmation,
+                    "send_per_hour": cfg.send_per_hour,
+                }
+                if cfg.send_enabled
+                else {}
+            ),
         },
     }
