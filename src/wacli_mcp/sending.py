@@ -20,6 +20,7 @@ import os
 import time
 import unicodedata
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -29,6 +30,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from .accounts import account_param
 from .config import Config
 from .runner import RateLimiter, WacliError, WacliRunner
 
@@ -121,14 +123,28 @@ class DuplicateGuard:
         self._seen.pop(key, None)
 
 
-def confirmation_question(alias: str, jid: str, text: str) -> str:
+def confirmation_question(alias: str, jid: str, text: str, account: str | None = None) -> str:
+    sender = f" from the {account} account" if account else ""
     return (
-        f"Send this WhatsApp message to {alias} ({jid})?\n\n"
+        f"Send this WhatsApp message{sender} to {alias} ({jid})?\n\n"
         f"{FRAME} message, {len(text)} characters {FRAME}\n"
         f"{text}\n"
         f"{FRAME} end of message {FRAME}\n\n"
-        f"Recipient: {alias} ({jid}). Approve only if you asked for this exact message."
+        f"Recipient: {alias} ({jid}){sender}. Approve only if you asked for this exact message."
     )
+
+
+@dataclass
+class _Sender:
+    """Per-account send state: each account has its own limit, duplicate window and daemon."""
+
+    view: Config
+    limiter: RateLimiter
+    guard: DuplicateGuard
+
+    @property
+    def aliases(self) -> str:
+        return ", ".join(alias for alias, _ in self.view.send_recipients)
 
 
 def register_send_tool(
@@ -137,43 +153,77 @@ def register_send_tool(
     runner: WacliRunner,
     audit: Callable[[dict[str, Any]], None],
 ) -> None:
-    assert cfg.send_enabled and cfg.store_dir is not None
-    store_dir = cfg.store_dir
-    limiter = RateLimiter(cfg.send_per_hour, window_s=3600.0)
-    guard = DuplicateGuard()
-    aliases = ", ".join(alias for alias, _ in cfg.send_recipients)
+    views = tuple(view for view in cfg.account_views() if view.send_enabled)
+    assert views and all(view.store_dir is not None for view in views)
+    senders = {
+        view.alias: _Sender(view, RateLimiter(view.send_per_hour, window_s=3600.0), DuplicateGuard()) for view in views
+    }
+    multi = cfg.multi_account
+    Account = account_param(cfg, views, "send from")  # noqa: N806
+    if multi:
+        aliases = "; ".join(f"{alias}: {sender.aliases}" for alias, sender in senders.items())
+        recipient_help = f"Recipient alias for the chosen account ({aliases})"
+    else:
+        aliases = senders[views[0].alias].aliases
+        recipient_help = f"Recipient alias: one of {aliases}"
     confirm_note = (
         "The user must confirm the exact text before it is sent. " if cfg.send_confirmation == "elicit" else ""
     )
 
-    def target(recipient: str) -> tuple[str, str]:
-        found = cfg.send_recipient(recipient.strip())
+    def sender_for(account: str) -> _Sender:
+        sender = senders.get(account)
+        if sender is None:
+            raise ToolError("sending is not enabled for this account")
+        return sender
+
+    def target(sender: _Sender, recipient: str) -> tuple[str, str]:
+        found = sender.view.send_recipient(recipient.strip())
         if found is None:
-            raise ToolError(f"recipient must be one of the configured aliases: {aliases}")
+            scope = " for this account" if multi else ""
+            raise ToolError(f"recipient must be one of the configured aliases{scope}: {sender.aliases}")
         return found
 
-    def preflight(recipient: str, text: str) -> tuple[str, str, str]:
+    def preflight(account: str, recipient: str, text: str) -> tuple[_Sender, str, str, str]:
         """Checks that are safe to repeat: they must not consume anything (see the multi-round-trip note)."""
-        alias, jid = target(recipient)
+        sender = sender_for(account)
+        alias, jid = target(sender, recipient)
         message = validate_message(text, cfg.send_max_chars)
-        if not limiter.would_allow():
-            raise ToolError(f"send limit of {cfg.send_per_hour} per hour reached")
-        guard.check(DuplicateGuard.key(jid, message))
-        if not daemon_owns_store(store_dir):
+        if not sender.limiter.would_allow():
+            raise ToolError(f"send limit of {sender.view.send_per_hour} per hour reached")
+        sender.guard.check(DuplicateGuard.key(jid, message))
+        assert sender.view.store_dir is not None
+        if not daemon_owns_store(sender.view.store_dir):
             raise ToolError("sending needs `wacli sync --follow` running for the configured store; nothing was sent")
-        return alias, jid, message
+        return sender, alias, jid, message
 
-    async def approval(recipient: str, text: str) -> SendApproval | Elicit[SendApproval]:
+    def rejected(account: str) -> dict[str, Any]:
+        record: dict[str, Any] = {"tool": "send_message", "outcome": "rejected", "stage": "preflight"}
+        if multi and account in senders:
+            record["account"] = account
+        return record
+
+    async def ask(account: str, recipient: str, text: str) -> SendApproval | Elicit[SendApproval]:
         try:
-            alias, jid, message = preflight(recipient, text)
+            _, alias, jid, message = preflight(account, recipient, text)
         except ToolError:
             # Refused before any prompt. Logged without the arguments, which come from the model.
-            audit({"tool": "send_message", "outcome": "rejected", "stage": "preflight"})
+            audit(rejected(account))
             raise
         if cfg.send_confirmation == "none":
             return SendApproval(approve=True)
         # Deterministic from the arguments, as multi-round-trip elicitation requires.
-        return Elicit(confirmation_question(alias, jid, message), SendApproval)
+        return Elicit(confirmation_question(alias, jid, message, account if multi else None), SendApproval)
+
+    if multi:
+
+        async def approval(account: str, recipient: str, text: str) -> SendApproval | Elicit[SendApproval]:
+            return await ask(account, recipient, text)
+
+    else:
+        only = views[0].alias
+
+        async def approval(recipient: str, text: str) -> SendApproval | Elicit[SendApproval]:
+            return await ask(only, recipient, text)
 
     @mcp.tool(
         title="Send WhatsApp message",
@@ -186,24 +236,34 @@ def register_send_tool(
         ),
     )
     async def send_message(
-        recipient: Annotated[str, Field(description=f"Recipient alias: one of {aliases}")],
+        account: Account,
+        recipient: Annotated[str, Field(description=recipient_help)],
         text: Annotated[str, Field(description=f"Plain text, at most {cfg.send_max_chars} characters")],
         approved: Annotated[SendApproval, Resolve(approval)],
     ) -> dict[str, Any]:
         started = time.monotonic()
-        alias, jid, message = preflight(recipient, text)
+        sender, alias, jid, message = preflight(account, recipient, text)
         record: dict[str, Any] = {"tool": "send_message", "recipient": alias, "chars": len(message)}
+        if multi:
+            record["account"] = account
         try:
             if not approved.approve:
                 record["outcome"] = "declined"
-                return {"sent": False, "recipient": alias, "reason": "the user did not approve this message"}
-            limiter.check()
+                return {
+                    **({"account": account} if multi else {}),
+                    "sent": False,
+                    "recipient": alias,
+                    "reason": "the user did not approve this message",
+                }
+            sender.limiter.check()
             key = DuplicateGuard.key(jid, message)
             # Reserved before the first await, so an identical call running concurrently is refused by its
             # preflight. It stays reserved unless the send definitely failed, including on cancellation.
-            guard.record(key)
+            sender.guard.record(key)
             try:
-                data = await runner.run_write(["send", "text", f"--to={jid}", f"--message={message}", "--no-preview"])
+                data = await runner.run_write(
+                    ["send", "text", f"--to={jid}", f"--message={message}", "--no-preview"], target=sender.view
+                )
             except WacliError as exc:
                 if exc.kind == "timeout" or any(marker in str(exc) for marker in UNCERTAIN_MARKERS):
                     record["outcome"] = "uncertain"
@@ -211,12 +271,13 @@ def register_send_tool(
                         "the send outcome is unknown: it may have been delivered. Do not retry; "
                         "check list_messages for this chat first."
                     ) from exc
-                guard.forget(key)
+                sender.guard.forget(key)
                 record["outcome"] = "failed"
                 raise ToolError(f"not sent: {exc}") from exc
             data = data if isinstance(data, dict) else {}
             record["outcome"] = "sent" if data.get("sent") else "unconfirmed"
             result: dict[str, Any] = {
+                **({"account": account} if multi else {}),
                 "sent": bool(data.get("sent")),
                 "recipient": alias,
                 "jid": jid,
