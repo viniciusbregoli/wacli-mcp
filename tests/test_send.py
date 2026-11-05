@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -200,6 +201,18 @@ async def test_definite_failure_allows_a_later_retry(fake, daemon):
         retried = await client.call_tool("send_message", {"recipient": "ada", "text": "hi"})
     assert failed.is_error and "not sent: not authenticated" in failed.content[0].text
     assert not retried.is_error
+
+
+async def test_concurrent_identical_sends_go_out_once(fake, daemon):
+    fake.scenario(stdout=json.dumps({"success": True, "data": SENT, "error": None}), sleep=1)
+    server = build_server(send_config(fake, send_confirmation="none"))
+    args = {"recipient": "ada", "text": "only once"}
+    async with Client(server, elicitation_callback=never_asked) as client:
+        results = await asyncio.gather(client.call_tool("send_message", args), client.call_tool("send_message", args))
+    assert sorted(r.is_error for r in results) == [False, True]
+    refused = next(r for r in results if r.is_error)
+    assert "already sent" in refused.content[0].text
+    assert len(fake.calls()) == 1
 
 
 async def test_health_reports_send_policy(fake, daemon):

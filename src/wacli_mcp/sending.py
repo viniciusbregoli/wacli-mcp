@@ -117,6 +117,9 @@ class DuplicateGuard:
     def record(self, key: str) -> None:
         self._seen[key] = self._clock()
 
+    def forget(self, key: str) -> None:
+        self._seen.pop(key, None)
+
 
 def confirmation_question(alias: str, jid: str, text: str) -> str:
     return (
@@ -196,19 +199,21 @@ def register_send_tool(
                 return {"sent": False, "recipient": alias, "reason": "the user did not approve this message"}
             limiter.check()
             key = DuplicateGuard.key(jid, message)
+            # Reserved before the first await, so an identical call running concurrently is refused by its
+            # preflight. It stays reserved unless the send definitely failed, including on cancellation.
+            guard.record(key)
             try:
                 data = await runner.run_write(["send", "text", f"--to={jid}", f"--message={message}", "--no-preview"])
             except WacliError as exc:
                 if exc.kind == "timeout" or any(marker in str(exc) for marker in UNCERTAIN_MARKERS):
-                    guard.record(key)
                     record["outcome"] = "uncertain"
                     raise ToolError(
                         "the send outcome is unknown: it may have been delivered. Do not retry; "
                         "check list_messages for this chat first."
                     ) from exc
+                guard.forget(key)
                 record["outcome"] = "failed"
                 raise ToolError(f"not sent: {exc}") from exc
-            guard.record(key)
             data = data if isinstance(data, dict) else {}
             record["outcome"] = "sent" if data.get("sent") else "unconfirmed"
             result: dict[str, Any] = {
