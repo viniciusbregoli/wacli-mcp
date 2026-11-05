@@ -156,8 +156,9 @@ inside the Tailscale tunnel, which WireGuard already encrypts. A hardened system
 
 ## Keeping the archive fresh
 
-This server only reads. Results describe what wacli has stored, and `last_sync_at` in each result says when a
-sync last completed. Run the sync yourself, for example as a service:
+This server only reads. Results describe what wacli has stored; message results (`list_messages`,
+`search_messages`) and `archive_health` include `last_sync_at`, which says when a sync last completed. Run the
+sync yourself, for example as a service:
 
 ```sh
 wacli sync --follow
