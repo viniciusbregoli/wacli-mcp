@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import pytest
 from conftest import unshare_works
 
-from wacli_mcp.runner import RateLimiter, WacliError, WacliRunner
+from wacli_mcp.runner import PASSTHROUGH_ENV, RateLimiter, WacliError, WacliRunner
 
 pytestmark = pytest.mark.anyio
 
@@ -36,8 +37,11 @@ async def test_child_env_is_minimal(fake, monkeypatch):
     assert env["HOME"] == str(fake.home)
     assert "ANTHROPIC_API_KEY" not in env
     assert "WACLI_STORE_DIR" not in env
-    # Only the interpreter's own additions may appear on top of what the runner sets.
-    assert set(env) - {"HOME", "PATH", "LANG", "WACLI_READONLY", "LC_CTYPE", "TZ"} == set()
+    # Beyond what the runner sets, only the documented passthrough keys (copied
+    # unchanged) and the interpreter's own LC_CTYPE may appear.
+    assert set(env) - {"HOME", "PATH", "LANG", "WACLI_READONLY", "LC_CTYPE", *PASSTHROUGH_ENV} == set()
+    for key in PASSTHROUGH_ENV:
+        assert env.get(key) == os.environ.get(key)
 
 
 async def test_error_envelope_is_surfaced(fake):
