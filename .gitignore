@@ -15,3 +15,7 @@ build/
 *.token
 token
 .env
+# wacli store contents, in case a store is ever created inside the checkout.
+media/
+LOCK
+.send.sock
