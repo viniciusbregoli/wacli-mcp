@@ -198,6 +198,28 @@ def test_wacli_account_resolution_failures_are_config_errors(fake, tmp_path, rep
         Config.from_env(env_for(fake, path))
 
 
+def test_relative_store_from_wacli_is_refused(fake, tmp_path):
+    base = fake.config(store_dir=None)
+    path = write_accounts(tmp_path, '[accounts.work]\nwacli_account = "work"\n')
+    with pytest.raises(ConfigError, match="relative store path"):
+        load_accounts_file(path, base, send_switch=False, resolve=lambda *_: Path(".wacli/accounts/work"))
+
+
+def test_check_reports_every_account(fake, tmp_path, stores, capsys, monkeypatch):
+    from wacli_mcp import cli
+
+    path = write_accounts(tmp_path, two_accounts(stores))
+    for key, value in env_for(fake, path).items():
+        monkeypatch.setenv(key, value)
+    fake.respond({"authenticated": False, "store": {"messages": 0}})
+    assert cli.main(["check"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert [(a["account"], a["store"]) for a in report["accounts"]] == [
+        ("personal", str(stores["personal"])),
+        ("work", str(stores["work"])),
+    ]
+
+
 def test_two_aliases_on_one_store_are_refused(fake, tmp_path, stores):
     base = fake.config(store_dir=None)
     path = write_accounts(tmp_path, '[accounts.a]\nwacli_account = "a"\n[accounts.b]\nwacli_account = "b"\n')
