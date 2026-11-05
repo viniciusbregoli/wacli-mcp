@@ -84,16 +84,20 @@ class WacliRunner:
         return self._parse(stdout, stderr, returncode)
 
     async def _spawn(self, argv: list[str]) -> tuple[bytes, bytes, int]:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self.build_env(),
-            cwd="/",
-            # Own process group, so a timeout can kill wacli together with the unshare wrapper.
-            start_new_session=True,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self.build_env(),
+                cwd="/",
+                # Own process group, so a timeout can kill wacli together with the unshare wrapper.
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # The binary was vetted at startup; it may have been removed or replaced since.
+            raise WacliError("could not start wacli", kind="spawn_error") from exc
         assert proc.stdout is not None and proc.stderr is not None
         overflow = asyncio.Event()
 

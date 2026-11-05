@@ -109,3 +109,11 @@ async def test_network_isolation_blocks_outbound(fake):
     assert sandboxed == {"net": "blocked"}
     # Shows the probe itself works; offline CI hosts report blocked for both.
     assert unsandboxed["net"] in ("reachable", "blocked")
+
+
+async def test_spawn_failure_is_a_safe_error(fake):
+    runner = WacliRunner(fake.config())
+    fake.path.unlink()
+    with pytest.raises(WacliError, match="could not start wacli") as info:
+        await runner.run(["doctor"])
+    assert info.value.kind == "spawn_error"
