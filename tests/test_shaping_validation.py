@@ -87,6 +87,13 @@ def test_chat_ref_accepts_ids_numbers_and_names(value):
     assert validation.chat_ref(value) == value
 
 
+def test_zwj_emoji_names_round_trip():
+    family = "Family " + chr(0x1F468) + chr(0x200D) + chr(0x1F469)
+    assert sanitize_text(family, 100) == family
+    assert validation.chat_ref(family) == family
+    assert validation.query_text(family) == family
+
+
 @pytest.mark.parametrize("value", ["", "x" * 101, f"Ada{RLO}", "a\nb"])
 def test_chat_ref_rejects_bad_values(value):
     with pytest.raises(ToolError):

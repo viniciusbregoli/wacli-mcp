@@ -21,11 +21,13 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 MAX_QUERY_CHARS = 200
 MAX_NAME_CHARS = 100
+_ZWJ = chr(0x200D)  # zero-width joiner, needed by emoji sequences
 
 
 def _no_controls(value: str, what: str) -> None:
     for ch in value:
-        if unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co"):
+        # ZWJ is allowed to match shaping.sanitize_text, which keeps it in names the model may pass back.
+        if ch != _ZWJ and unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co"):
             raise ToolError(f"{what} contains control or invisible characters")
 
 
