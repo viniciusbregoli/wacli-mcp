@@ -64,11 +64,32 @@ class WacliRunner:
         # One send at a time, so confirmations and outcomes map one to one.
         self._write_lock = asyncio.Lock()
 
-    def build_argv(self, args: Sequence[str], *, write: bool = False, target: Config | None = None) -> list[str]:
+    def build_argv(
+        self,
+        args: Sequence[str],
+        *,
+        write: bool = False,
+        network: bool = False,
+        max_file_bytes: int | None = None,
+        target: Config | None = None,
+    ) -> list[str]:
         """Build the argv for one call. `target` is the account view to run against (default: the server's)."""
         cfg = self.cfg
         selector = target or cfg
-        argv = [*cfg.sandbox_prefix, str(cfg.wacli_bin)]
+        # Media download is the only command allowed out of the empty network
+        # namespace: in --read-only mode wacli fetches the encrypted file from the
+        # WhatsApp CDN without opening a session.
+        if network and (write or tuple(args[:2]) != ("media", "download")):
+            raise WacliError("network access is only allowed for media download", kind="policy")
+        if network and max_file_bytes is None:
+            raise WacliError("a network download needs a file size limit", kind="policy")
+        if network:
+            # prlimit sets RLIMIT_FSIZE in the child only. Setting it from Python
+            # (preexec_fn) is unsafe in a threaded server and would also bind this process.
+            prefix: tuple[str, ...] = (str(cfg.prlimit_bin), f"--fsize={max_file_bytes}:{max_file_bytes}", "--")
+        else:
+            prefix = cfg.sandbox_prefix
+        argv = [*prefix, str(cfg.wacli_bin)]
         if write:
             argv += ["--json", f"--timeout={int(cfg.send_timeout_s)}s"]
         else:
@@ -97,10 +118,21 @@ class WacliRunner:
                 env[key] = os.environ[key]
         return env
 
-    async def run(self, args: Sequence[str], target: Config | None = None) -> Any:
-        """Run one wacli read command and return the `data` field of its JSON envelope."""
+    async def run(
+        self,
+        args: Sequence[str],
+        *,
+        network: bool = False,
+        max_file_bytes: int | None = None,
+        target: Config | None = None,
+    ) -> Any:
+        """Run one wacli read command and return the `data` field of its JSON envelope.
+
+        max_file_bytes sets RLIMIT_FSIZE on the child (through prlimit), so a download
+        larger than the limit is stopped while it is written instead of filling the disk.
+        """
+        argv = self.build_argv(args, network=network, max_file_bytes=max_file_bytes, target=target)
         self._limiter.check()
-        argv = self.build_argv(args, target=target)
         async with self._sem:
             stdout, stderr, returncode = await self._spawn(argv, self.build_env(), self.cfg.timeout_s)
         return self._parse(stdout, stderr, returncode)
