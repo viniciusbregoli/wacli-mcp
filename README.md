@@ -4,9 +4,12 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an 
 WhatsApp archive mirrored locally by [wacli](https://github.com/openclaw/wacli), and, only if you opt in, send plain
 text to a short list of recipients you name.
 
-By default it is read-only. It never edits, deletes, reacts, marks as read, downloads media, back-fills history,
-or links an account; those code paths do not exist here. Keeping the archive current, and owning the WhatsApp
-connection, is left to `wacli sync --follow`, running as a separate process you control.
+By default it is read-only. It never edits, deletes, reacts, marks as read, back-fills history, or links an
+account; those code paths do not exist here. Photos and videos from group chats can be returned in two ways:
+`get_group_media` reads copies wacli already has on disk, and the opt-in `download_group_media` fetches one file
+from WhatsApp's media servers through wacli's read-only download (no WhatsApp session, nothing sent). Direct-chat
+media is never returned. Keeping the archive current, and owning the WhatsApp connection, is left to
+`wacli sync --follow`, running as a separate process you control.
 
 The design follows the MCP guidance in wacli's own
 [companion integrations guide](https://github.com/openclaw/wacli/blob/main/docs/integrations.md#model-context-protocol-mcp):
@@ -29,8 +32,15 @@ instead of using whatsmeow directly, and what was evaluated.
 | `search_contacts` | `contacts search` |
 | `history_coverage` | `history coverage` |
 | `archive_health` | `doctor` (never with `--connect`) |
+| `get_group_media` | `messages show --chat=<group JID> --id=<msg_id>`, then reads the already-downloaded file |
+| `download_group_media` (opt-in) | `messages show` offline, then `media download --chat --id --output=<private temp dir>` |
 
-Every tool carries `readOnlyHint: true` and `openWorldHint: false`. Results are wrapped with
+Both media tools only accept an exact group JID (ending in `@g.us`) that the chat policy allows; direct chats,
+names and phone numbers are refused. The other tools are unchanged and still cover direct chats and contacts.
+Message results carry `media_available_locally: true` when a local copy exists, never the path itself.
+
+Every tool except `download_group_media` carries `readOnlyHint: true` and `openWorldHint: false`;
+`download_group_media` carries `readOnlyHint: false`, `idempotentHint: true` and `openWorldHint: true`. Results are wrapped with
 `untrusted_content: true` and a notice telling the model not to follow instructions found in messages.
 
 With sending enabled (see [Sending](#sending)) one more tool appears:
@@ -68,11 +78,36 @@ The layers, from outside in:
    result row.
 7. **Output shaping.** Only known fields are returned. Local media paths and WhatsApp CDN paths are dropped.
    Bidirectional-override, zero-width and control characters are stripped so text cannot disguise itself.
-8. **Executable vetting.** The wacli binary and its directory must not be writable by group or others; you can also
+8. **Group media reads.** `get_group_media` never runs `wacli media download`, which contacts the WhatsApp CDN
+   even under `--read-only`. It asks wacli for one message of the named group, checks that the returned chat and
+   message ID match, and only accepts `MediaType` `image` or `video`. The recorded file must sit lexically under the
+   media directory (no `..`), and every path component is opened relative to the previous directory with
+   `O_NOFOLLOW`, so no symlink is followed at any level and nothing can be swapped between check and open. The file
+   must be a regular, single-link file owned by the server's user and within `WACLI_MCP_MAX_MEDIA_BYTES`, and its
+   magic bytes must identify a JPEG, PNG, WebP or GIF photo, or an MP4, 3GP or QuickTime video matching the
+   message's media type. The sniffed type is reported, not the sender's declared one. Photos are returned as image
+   content, videos as an embedded blob resource; the model never supplies a path. Media calls run one at a time.
+9. **Opt-in media download.** `download_group_media` exists only with `WACLI_MCP_ALLOW_MEDIA_DOWNLOAD=1` and a
+   private `WACLI_MCP_DOWNLOAD_DIR`. Every call first checks the message offline: it must be in the named group, a
+   photo or video, not deleted, within the declared size limit, and carry a well-formed WhatsApp direct path
+   (`/v/...` or `/o1/v/...`, with no `..`, `//`, `%2e` or `%2f`), so the download URL cannot point anywhere but
+   WhatsApp's CDN host. `media download`
+   is then the only wacli command that runs outside the empty network namespace, still with `--read-only` and
+   `WACLI_READONLY=1`; in that mode wacli 0.25.1 fetches the encrypted file from the WhatsApp CDN and decrypts it
+   without opening a WhatsApp session, and leaves `wacli.db` and `session.db` untouched. `--retry-on-phone` is never
+   passed. The child runs under `prlimit` with `RLIMIT_FSIZE` just above the size limit, writes into a fresh private temporary
+   directory, and the server accepts exactly one regular file there, validates it like any other media file, and
+   writes the validated bytes as `<group digits>.<msg_id>.<ext>` (mode 0600, never replacing or following an
+   existing entry). New downloads are refused once the directory holds `WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES`. A saved
+   copy is served again after the same offline check, without network access. Failed downloads report only an HTTP
+   status, never wacli's text (which can contain the CDN URL with its access tokens). Leftovers of interrupted
+   downloads older than ten minutes (or four times the timeout) are removed at startup; younger ones may belong to
+   another server process sharing the directory.
+10. **Executable vetting.** The wacli binary and its directory must not be writable by group or others; you can also
    pin its SHA-256.
-9. **Audit log.** Optional JSON-lines log (mode 0600) with tool name, outcome, duration and result counts. It never
+11. **Audit log.** Optional JSON-lines log (mode 0600) with tool name, outcome, duration and result counts. It never
    records arguments, because queries and names are personal data.
-10. **HTTP transport (optional).** Bearer token from a mode-0600 file, constant-time comparison, binding limited to
+12. **HTTP transport (optional).** Bearer token from a mode-0600 file, constant-time comparison, binding limited to
     loopback or Tailscale addresses, Host header allowlist (DNS rebinding protection), and browser `Origin`
     requests refused.
 
@@ -108,6 +143,12 @@ All settings are environment variables read once at startup. None can be changed
 | `WACLI_MCP_STORE` | wacli's default | Store directory (exclusive with `WACLI_MCP_ACCOUNT`) |
 | `WACLI_MCP_ACCOUNT` | unset | Named wacli account |
 | `WACLI_MCP_NETWORK_ISOLATION` | `require` | `require`, `auto` or `off` |
+| `WACLI_MCP_MEDIA_DIR` | `<WACLI_MCP_STORE>/media` if it exists and is private, else unset | Directory group media is served from; unset disables `get_group_media`. An unsafe auto-detected directory only disables media; an unsafe explicit one stops startup |
+| `WACLI_MCP_MAX_MEDIA_BYTES` | `3145728` | Largest photo or video returned or downloaded (64 KiB to 64 MiB). The default keeps base64 below the 5 MB per-image limit of common model APIs |
+| `WACLI_MCP_ALLOW_MEDIA_DOWNLOAD` | `0` | `1` registers `download_group_media` |
+| `WACLI_MCP_DOWNLOAD_DIR` | required with downloads | Private directory (not group- or world-writable) for downloaded copies |
+| `WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES` | `1073741824` | Total size of the download directory after which new downloads are refused |
+| `WACLI_MCP_PRLIMIT` | `/usr/bin/prlimit` | util-linux `prlimit`, required with downloads; caps the size of the file the download child writes |
 | `WACLI_MCP_ALLOWED_CHATS` | unset | Comma-separated JIDs; when set, only these chats are visible |
 | `WACLI_MCP_DENIED_CHATS` | unset | Comma-separated JIDs that are never visible |
 | `WACLI_MCP_TIMEOUT_S` | `20` | Per-call timeout (1 to 120) |
@@ -298,10 +339,29 @@ wacli's read commands work while `sync --follow` holds the store lock.
   should never leave the machine.
 - wacli's JSON fields are not a formal API. Integration tests pin the behaviour of the tested version; run them
   after upgrading wacli.
-- Media is not available: there is no download tool, by design. Sending is plain text only: no files, replies,
-  mentions or link previews.
+- Sending is plain text only: no files, replies, mentions or link previews.
 - Delivery is not confirmed. A successful `send_message` means WhatsApp accepted the message, not that the
   recipient's phone received it.
+- Without `WACLI_MCP_ALLOW_MEDIA_DOWNLOAD=1`, media is served only if it is already in the store's media
+  directory. Files saved elsewhere (for example with `media download --output`) are refused by `get_group_media`.
+- A download needs outbound HTTPS from wacli to WhatsApp's media servers. The server cannot restrict that process
+  to those hosts; it relies on wacli's read-only download path, which was verified with wacli 0.25.1. Re-check after
+  upgrading wacli. Media older than WhatsApp's retention may fail with an HTTP error; recovering it would need
+  `--retry-on-phone`, which contacts the phone and is deliberately not offered.
+- The declared size is the sender's claim. If it understates the file, wacli still fetches until `RLIMIT_FSIZE`
+  stops it, so at most about 1 MiB over the limit is transferred and written before the call fails.
+- Saved copies stay until removed by hand, even after the original message is deleted; they are only no longer
+  served. Delete files from `WACLI_MCP_DOWNLOAD_DIR` to get rid of them.
+- The server cannot prove that the bytes wacli downloads belong to the checked message (wacli's JSON has no content
+  hash to compare against). It relies on wacli looking the message up by chat and ID, which could not be verified
+  without a real conflicting message.
+- When the store is wacli's default rather than `WACLI_MCP_STORE`, set `WACLI_MCP_MEDIA_DIR` explicitly.
+- The server checks that a media file sits in the media directory, not that the file belongs to that message; it
+  relies on wacli recording the right `local_path`.
+- A media file with a second hard link is refused. If wacli ever deduplicates media with hard links, those files
+  will not be served.
+- Videos come back as an embedded blob resource; whether a client can show or forward them depends on the client.
+  Base64 makes each response about a third larger than the file.
 
 ## Development
 
