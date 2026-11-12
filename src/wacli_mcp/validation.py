@@ -13,7 +13,8 @@ from datetime import date, datetime
 
 from mcp.server.mcpserver.exceptions import ToolError
 
-from .config import JID_RE, Config
+from .config import GROUP_JID_RE, JID_RE, Config
+from .media import MESSAGE_ID_RE
 
 PHONE_RE = re.compile(r"^\+?[0-9][0-9 ()-]{4,24}$")
 CURSOR_RE = re.compile(r"^[A-Za-z0-9_+/=-]{1,2048}$")
@@ -78,6 +79,26 @@ def time_bound(value: str, what: str) -> str:
                 raise ValueError
     except ValueError as exc:
         raise ToolError(f"{what} must be YYYY-MM-DD or an RFC3339 timestamp with a timezone") from exc
+    return value
+
+
+def media_group(value: str, cfg: Config) -> str:
+    """An exact group JID that the operator's chat policy allows.
+
+    Names and phone numbers are refused: wacli could resolve them to a direct chat.
+    """
+    value = value.strip()
+    if not GROUP_JID_RE.fullmatch(value):
+        raise ToolError("media is only served from group chats: pass the group's exact JID ending in @g.us")
+    if not cfg.chat_visible(value):
+        raise ToolError("this chat is not available through this server")
+    return value
+
+
+def message_id(value: str) -> str:
+    value = value.strip()
+    if not MESSAGE_ID_RE.fullmatch(value):
+        raise ToolError("message_id must be the msg_id of a message returned by list_messages or search_messages")
     return value
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,6 +29,8 @@ NetworkIsolation = Literal["require", "auto", "off"]
 
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 JID_RE = re.compile(r"^[0-9A-Za-z._:+-]{1,64}@(s\.whatsapp\.net|g\.us|lid|newsletter|broadcast|c\.us)$")
+# Group JIDs only: current groups are all digits, legacy ones are <creator>-<timestamp>.
+GROUP_JID_RE = re.compile(r"(?:[0-9]{5,32}|[0-9]{5,20}-[0-9]{5,20})@g\.us")
 # Sending is limited to people and groups. Channels, status and broadcast lists are excluded.
 SEND_JID_RE = re.compile(r"^[0-9]{5,20}(-[0-9]{5,20})?@(s\.whatsapp\.net|g\.us|lid)$")
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -167,6 +170,18 @@ def validate_executable(path: Path, *, sha256: str | None = None) -> Path:
     return resolved
 
 
+def _media_dir(path: Path, what: str) -> Path:
+    """Vet the directory media files are served from and return its resolved form."""
+    if not path.is_absolute():
+        raise ConfigError(f"{what} must be absolute")
+    if not path.is_dir():
+        raise ConfigError(f"{what} does not exist or is not a directory: {path}")
+    resolved = path.resolve(strict=True)
+    # Another local user who can write here could plant files for the server to hand out.
+    _check_not_writable_by_others(resolved, what)
+    return resolved
+
+
 def probe_network_isolation(unshare: Path) -> bool:
     """Return True if an unprivileged empty network namespace can be created."""
     try:
@@ -201,6 +216,15 @@ class Config:
     # Command prefix that puts every wacli call in an empty network namespace.
     # Empty tuple means no isolation.
     sandbox_prefix: tuple[str, ...] = ()
+    # Directory get_group_media reads already-downloaded files from; None disables it.
+    media_dir: Path | None = None
+    # 3 MiB keeps the base64 form below the 5 MB per-image limit of common model APIs.
+    max_media_bytes: int = 3 * 1024 * 1024
+    allow_media_download: bool = False
+    download_dir: Path | None = None
+    max_download_dir_bytes: int = 1024 * 1024 * 1024
+    # Caps the size of the file a download child may write.
+    prlimit_bin: Path = Path("/usr/bin/prlimit")
     # Sending (off unless WACLI_MCP_ENABLE_SEND=1 and recipients are configured).
     send_enabled: bool = False
     send_recipients: tuple[tuple[str, str], ...] = ()  # (alias, JID) pairs
@@ -296,6 +320,36 @@ class Config:
         if allowed & denied:
             raise ConfigError("a JID cannot be both allowed and denied")
 
+        media_raw = env.get("WACLI_MCP_MEDIA_DIR", "").strip()
+        media_dir = None
+        if media_raw:
+            media_dir = _media_dir(Path(media_raw), "WACLI_MCP_MEDIA_DIR")
+        elif store_dir is not None and (store_dir / "media").is_dir():
+            # Auto-detected, so a bad directory only disables media; it must not stop the text tools.
+            try:
+                media_dir = _media_dir(store_dir / "media", "store media directory")
+            except (ConfigError, OSError, RuntimeError) as exc:
+                logging.getLogger("wacli_mcp").warning("media access disabled: %s", exc)
+
+        allow_raw = env.get("WACLI_MCP_ALLOW_MEDIA_DOWNLOAD", "").strip().lower()
+        if allow_raw not in ("", "0", "1", "false", "true"):
+            raise ConfigError("WACLI_MCP_ALLOW_MEDIA_DOWNLOAD must be 1 or 0")
+        allow_media_download = allow_raw in ("1", "true")
+        download_dir = None
+        if allow_media_download:
+            download_raw = env.get("WACLI_MCP_DOWNLOAD_DIR", "").strip()
+            if not download_raw:
+                raise ConfigError(
+                    "WACLI_MCP_ALLOW_MEDIA_DOWNLOAD=1 requires WACLI_MCP_DOWNLOAD_DIR (a private directory)"
+                )
+            download_dir = _media_dir(Path(download_raw), "WACLI_MCP_DOWNLOAD_DIR")
+            try:
+                prlimit_bin = validate_executable(Path(env.get("WACLI_MCP_PRLIMIT", "/usr/bin/prlimit")))
+            except ConfigError as exc:
+                raise ConfigError(f"media download needs prlimit to cap the file size: {exc}") from exc
+        else:
+            prlimit_bin = Path("/usr/bin/prlimit")
+
         audit_raw = env.get("WACLI_MCP_AUDIT_LOG", "").strip()
         audit_log = Path(audit_raw) if audit_raw else None
         if audit_log and not audit_log.is_absolute():
@@ -360,6 +414,14 @@ class Config:
             denied_chats=denied,
             audit_log=audit_log,
             sandbox_prefix=sandbox_prefix,
+            media_dir=media_dir,
+            max_media_bytes=_int(env, "WACLI_MCP_MAX_MEDIA_BYTES", 3 * 1024 * 1024, 64 * 1024, 64 * 1024 * 1024),
+            allow_media_download=allow_media_download,
+            download_dir=download_dir,
+            prlimit_bin=prlimit_bin,
+            max_download_dir_bytes=_int(
+                env, "WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES", 1024 * 1024 * 1024, 1024 * 1024, 100 * 1024 * 1024 * 1024
+            ),
             send_enabled=send_enabled,
             send_recipients=send_recipients,
             send_confirmation=confirmation,  # type: ignore[arg-type]
