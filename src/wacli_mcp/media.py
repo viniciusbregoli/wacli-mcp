@@ -260,6 +260,15 @@ def save_within_capacity(directory: Path, name: str, data: bytes, max_total_byte
             raise MediaError("the download directory cannot be locked") from exc
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            # A copy another process saved meanwhile counts toward usage; it must be served, not called "full".
+            try:
+                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise MediaError("the download directory cannot be read") from exc
+            else:
+                raise AlreadySaved("a file with the download's name already exists")
             if directory_usage(directory) + len(data) > max_total_bytes:
                 raise MediaError("the download directory is full (WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES)")
             save_new_file(directory, name, data)

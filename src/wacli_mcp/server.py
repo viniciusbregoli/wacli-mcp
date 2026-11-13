@@ -506,29 +506,41 @@ def build_server(cfg: Config, runner: WacliRunner | None = None) -> MCPServer:
                         planned = length if isinstance(length, int) and length > 0 else cfg.max_media_bytes
                         used = await asyncio.to_thread(media.directory_usage, download_dir)
                         if used + planned > cfg.max_download_dir_bytes:
-                            raise media.MediaError("the download directory is full (WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES)")
-                        # wacli picks its own file name, so it writes into a fresh private
-                        # directory and only the validated bytes are kept, under our name.
-                        try:
-                            tmp = Path(tempfile.mkdtemp(prefix=".download-", dir=download_dir))
-                        except OSError as exc:
-                            raise media.MediaError("the download directory cannot be written") from exc
-                        try:
-                            fetch = ["media", "download", f"--chat={group}", f"--id={msg_id}", f"--output={tmp}"]
-                            if tuple(fetch[:2]) not in NETWORK_COMMANDS:
-                                raise ToolError("command not allowed")
-                            try:
-                                await runner.run(
-                                    fetch, network=True, max_file_bytes=cfg.max_media_bytes + 1024 * 1024, target=view
+                            # Another process may have saved this message since the first look.
+                            saved = await asyncio.to_thread(media.find_saved, download_dir, stem, cfg.max_media_bytes)
+                            if saved is None:
+                                raise media.MediaError(
+                                    "the download directory is full (WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES)"
                                 )
-                            except WacliError as exc:
-                                if exc.kind == "rate_limit":
-                                    raise
-                                raise media.MediaError(_download_failure(exc)) from exc
-                            data = await asyncio.to_thread(media.read_single_file, tmp, cfg.max_media_bytes)
-                        finally:
-                            shutil.rmtree(tmp, ignore_errors=True)
-                        downloaded = True
+                        if saved is not None:
+                            name, data = saved
+                            downloaded = False
+                        else:
+                            # wacli picks its own file name, so it writes into a fresh private
+                            # directory and only the validated bytes are kept, under our name.
+                            try:
+                                tmp = Path(tempfile.mkdtemp(prefix=".download-", dir=download_dir))
+                            except OSError as exc:
+                                raise media.MediaError("the download directory cannot be written") from exc
+                            try:
+                                fetch = ["media", "download", f"--chat={group}", f"--id={msg_id}", f"--output={tmp}"]
+                                if tuple(fetch[:2]) not in NETWORK_COMMANDS:
+                                    raise ToolError("command not allowed")
+                                try:
+                                    await runner.run(
+                                        fetch,
+                                        network=True,
+                                        max_file_bytes=cfg.max_media_bytes + 1024 * 1024,
+                                        target=view,
+                                    )
+                                except WacliError as exc:
+                                    if exc.kind == "rate_limit":
+                                        raise
+                                    raise media.MediaError(_download_failure(exc)) from exc
+                                data = await asyncio.to_thread(media.read_single_file, tmp, cfg.max_media_bytes)
+                            finally:
+                                shutil.rmtree(tmp, ignore_errors=True)
+                            downloaded = True
                     mime = media.sniff(data[:16])
                     if mime is None or mime.split("/")[0] != media_type:
                         raise media.MediaError(f"the file content is not a supported {media_type}")

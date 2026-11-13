@@ -566,3 +566,33 @@ async def test_capacity_lock_file_is_private_and_ignored_by_cleanup(fake, downlo
     os.utime(lock, (1, 1))
     media.remove_stale(downloads, max_age_s=60)
     assert lock.exists()
+
+
+def test_a_copy_saved_by_another_process_wins_over_a_full_directory(tmp_path):
+    from wacli_mcp import media
+
+    (tmp_path / "x.jpg").write_bytes(JPEG)
+    with pytest.raises(media.AlreadySaved):
+        media.save_within_capacity(tmp_path, "x.jpg", JPEG, max_total_bytes=len(JPEG) + 1)
+
+
+async def test_a_copy_saved_meanwhile_is_served_instead_of_refusing_a_full_directory(fake, downloads, monkeypatch):
+    from wacli_mcp import media
+
+    real = media.find_saved
+    calls = []
+
+    def find_saved(directory, stem, max_bytes):
+        calls.append(stem)
+        if len(calls) == 1:
+            # Another server process saves this message right after our first look.
+            (downloads / SAVED_JPEG).write_bytes(JPEG)
+            return None
+        return real(directory, stem, max_bytes)
+
+    monkeypatch.setattr(media, "find_saved", find_saved)
+    fake.respond(show())
+    result = await download(fake, downloads, max_download_dir_bytes=JPEG_LENGTH + 10)
+    assert not result.is_error, result.content
+    assert result.structured_content["downloaded"] is False
+    assert not any("media" in c["argv"] and "download" in c["argv"] for c in fake.calls())
