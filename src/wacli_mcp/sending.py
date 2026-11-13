@@ -247,6 +247,8 @@ async def _deliver(
         if exc.kind in ("timeout", "output_limit", "protocol") or any(
             marker in str(exc) for marker in UNCERTAIN_MARKERS
         ):
+            # The window starts when the send ends, so a long wait for the write lock cannot shorten it.
+            sender.guard.record(key)
             record["outcome"] = "uncertain"
             raise ToolError(
                 "the send outcome is unknown: it may have been delivered. Do not retry; "
@@ -256,6 +258,7 @@ async def _deliver(
         record["outcome"] = "failed"
         raise ToolError(f"not sent: {scrub(str(exc))}") from exc
     data = data if isinstance(data, dict) else {}
+    sender.guard.record(key)
     record["outcome"] = "sent" if data.get("sent") else "unconfirmed"
     return data
 

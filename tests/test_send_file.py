@@ -1279,3 +1279,20 @@ async def test_a_cancelled_load_keeps_its_permit_until_its_thread_ends(fake, dae
         assert len(started) == 2, "a third load started while two threads were still reading"
         release.set()
         await asyncio.gather(first, second, third, return_exceptions=True)
+
+
+def test_the_duplicate_window_starts_when_a_send_finishes():
+    from wacli_mcp.runner import RateLimiter
+    from wacli_mcp.sending import DuplicateGuard, _deliver, _Sender
+
+    now = [0.0]
+    guard = DuplicateGuard(window_s=600.0, clock=lambda: now[0])
+    sender = _Sender(None, RateLimiter(10, window_s=3600.0), guard)
+
+    async def slow_send():
+        now[0] += 700.0  # queued behind other writes for longer than the window
+        return {"sent": True}
+
+    asyncio.run(_deliver(sender, "k", {}, slow_send))
+    with pytest.raises(ToolError, match="already sent"):
+        guard.check("k", "file")
