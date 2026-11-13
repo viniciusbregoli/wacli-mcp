@@ -10,6 +10,7 @@ here.
 
 from __future__ import annotations
 
+import errno
 import grp
 import hashlib
 import ipaddress
@@ -20,6 +21,7 @@ import pwd
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tomllib
 from collections.abc import Callable, Mapping
@@ -187,6 +189,34 @@ def _group_is_private(gid: int) -> bool:
     return not any(user.pw_gid == gid and user.pw_uid != os.getuid() for user in pwd.getpwall())
 
 
+_ACL_XATTR = "system.posix_acl_access"
+_ACL_VERSION = 2
+_ACL_USER, _ACL_GROUP = 0x02, 0x08
+_ACL_WRITE = 0x02
+
+
+def _acl_grants_others(path: Path, perms: int) -> bool:
+    """True when the directory's POSIX ACL gives a named user other than us, or a named group that is not our
+    private group, any of `perms`. Mode bits do not show these entries. The ACL mask is ignored, which only
+    makes the check stricter. An ACL in a format this code does not know counts as granting access."""
+    try:
+        raw = os.getxattr(path, _ACL_XATTR, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return False
+        raise
+    if len(raw) < 4 or (len(raw) - 4) % 8 or struct.unpack_from("<I", raw)[0] != _ACL_VERSION:
+        return True
+    for tag, perm, ident in struct.iter_unpack("<HHI", raw[4:]):
+        if not perm & perms:
+            continue
+        if tag == _ACL_USER and ident != os.getuid():
+            return True
+        if tag == _ACL_GROUP and not _group_is_private(ident):
+            return True
+    return False
+
+
 def _check_ancestors(path: Path, what: str) -> None:
     """Every parent of a trusted directory must be trusted too, or its owner could be swapped after startup.
 
@@ -207,6 +237,8 @@ def _check_ancestors(path: Path, what: str) -> None:
                 raise ConfigError(f"{what} {path}: parent {parent} is writable by others")
             if st.st_mode & stat.S_IWGRP and not _group_is_private(st.st_gid):
                 raise ConfigError(f"{what} {path}: parent {parent} is writable by a group that has other members")
+            if _acl_grants_others(parent, _ACL_WRITE):
+                raise ConfigError(f"{what} {path}: parent {parent} has an access control list that lets others write")
     except OSError as exc:
         raise ConfigError(f"{what} {path}: a parent directory cannot be checked: {exc.strerror}") from exc
 
@@ -228,6 +260,12 @@ def _private_dir(path: Path, what: str) -> Path:
         )
     if st.st_mode & 0o077:
         raise ConfigError(f"{what} {resolved} must not be accessible by group or others (chmod 700)")
+    try:
+        shared = _acl_grants_others(resolved, 0o7)
+    except OSError as exc:
+        raise ConfigError(f"{what} {resolved}: its access control list cannot be read: {exc.strerror}") from exc
+    if shared:
+        raise ConfigError(f"{what} {resolved} has an access control list that gives others access")
     _check_ancestors(resolved, what)
     return resolved
 
@@ -241,6 +279,12 @@ def _media_dir(path: Path, what: str) -> Path:
     resolved = path.resolve(strict=True)
     # Another local user who can write here could plant files for the server to hand out.
     _check_not_writable_by_others(resolved, what)
+    try:
+        shared = _acl_grants_others(resolved, _ACL_WRITE)
+    except OSError as exc:
+        raise ConfigError(f"{what} {resolved}: its access control list cannot be read: {exc.strerror}") from exc
+    if shared:
+        raise ConfigError(f"{what} {resolved} has an access control list that lets others write")
     _check_ancestors(resolved, what)
     return resolved
 

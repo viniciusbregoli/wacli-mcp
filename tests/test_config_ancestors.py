@@ -5,6 +5,7 @@ from __future__ import annotations
 import grp
 import os
 import pwd
+import struct
 from pathlib import Path
 
 import pytest
@@ -132,3 +133,65 @@ def test_the_outbox_and_staging_under_an_open_ancestor_are_refused(fake, tmp_pat
     env[which] = str(make(make(tmp_path / "open", 0o777) / "d", 0o700))
     with pytest.raises(ConfigError, match=f"{which}.*writable by others"):
         Config.from_env(env)
+
+
+# POSIX ACL extended attribute, as the Linux kernel stores it: a version, then (tag, perm, id) entries.
+ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK, ACL_OTHER = 0x01, 0x02, 0x04, 0x08, 0x10, 0x20
+NO_ID = 0xFFFFFFFF
+
+
+def acl(*entries: tuple[int, int, int], version: int = 2) -> bytes:
+    base = [(ACL_USER_OBJ, 7, NO_ID), (ACL_GROUP_OBJ, 5, NO_ID), (ACL_MASK, 7, NO_ID), (ACL_OTHER, 5, NO_ID)]
+    return struct.pack("<I", version) + b"".join(struct.pack("<HHI", *e) for e in [*base, *entries])
+
+
+def with_acl(monkeypatch, path: Path, value: bytes) -> None:
+    real = os.getxattr
+
+    def getxattr(target, name, *args, **kwargs):
+        if Path(target) == path and name == "system.posix_acl_access":
+            return value
+        return real(target, name, *args, **kwargs)
+
+    monkeypatch.setattr(config.os, "getxattr", getxattr)
+
+
+def test_an_ancestor_whose_acl_lets_another_user_write_is_refused(tmp_path, monkeypatch):
+    parent = make(tmp_path / "acl", 0o755)
+    with_acl(monkeypatch, parent, acl((ACL_USER, 7, 4242)))
+    with pytest.raises(ConfigError, match="access control list"):
+        _check_ancestors(make(parent / "dir", 0o700).resolve(), "X")
+
+
+def test_an_ancestor_whose_acl_lets_a_shared_group_write_is_refused(tmp_path, monkeypatch):
+    parent = make(tmp_path / "acl", 0o755)
+    with_acl(monkeypatch, parent, acl((ACL_GROUP, 3, 4343)))
+    with pytest.raises(ConfigError, match="access control list"):
+        _check_ancestors(make(parent / "dir", 0o700).resolve(), "X")
+
+
+def test_an_acl_that_only_grants_read_or_names_the_user_is_accepted(tmp_path, monkeypatch):
+    parent = make(tmp_path / "acl", 0o755)
+    with_acl(monkeypatch, parent, acl((ACL_USER, 5, 4242), (ACL_USER, 7, os.getuid())))
+    _check_ancestors(make(parent / "dir", 0o700).resolve(), "X")
+
+
+def test_an_acl_in_an_unknown_format_is_refused(tmp_path, monkeypatch):
+    parent = make(tmp_path / "acl", 0o755)
+    with_acl(monkeypatch, parent, acl(version=3))
+    with pytest.raises(ConfigError, match="access control list"):
+        _check_ancestors(make(parent / "dir", 0o700).resolve(), "X")
+
+
+def test_a_media_dir_whose_own_acl_lets_another_user_write_is_refused(tmp_path, monkeypatch):
+    media = make(tmp_path / "media", 0o755).resolve()
+    with_acl(monkeypatch, media, acl((ACL_USER, 2, 4242)))
+    with pytest.raises(ConfigError, match="access control list"):
+        config._media_dir(media, "WACLI_MCP_MEDIA_DIR")
+
+
+def test_a_private_dir_whose_acl_lets_another_user_read_is_refused(tmp_path, monkeypatch):
+    private = make(tmp_path / "private", 0o700).resolve()
+    with_acl(monkeypatch, private, acl((ACL_USER, 4, 4242)))
+    with pytest.raises(ConfigError, match="access control list"):
+        config._private_dir(private, "WACLI_MCP_SEND_STAGING_DIR")

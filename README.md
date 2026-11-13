@@ -451,8 +451,9 @@ wacli's read commands work while `sync --follow` holds the store lock.
 - The media, download, outbox and staging directories are checked together with all their parents: each parent must
   be owned by you or root, and must not be writable by others unless it is sticky (such as `/tmp`). A parent may be
   group-writable only when that group is your own private group, which no other account belongs to (as with
-  `~/.local` and `~/.local/state` on many systems). Otherwise another local user could swap a directory after
-  startup. An unsafe auto-detected `<store>/media` only disables media; the explicit settings stop startup. The
+  `~/.local` and `~/.local/state` on many systems). POSIX ACLs count too: a parent, or a media directory or outbox,
+  whose ACL lets another user or a shared group write is refused, and the download and staging directories may not
+  grant any ACL access at all. Otherwise another local user could swap a directory after startup. An unsafe auto-detected `<store>/media` only disables media; the explicit settings stop startup. The
   download directory and the staging directory also need mode 700 and your ownership; media directories may be
   readable by others.
 - The download directory's capacity is checked again under a lock (`.capacity.lock`, kept in the directory) just
