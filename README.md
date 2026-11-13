@@ -143,7 +143,7 @@ All settings are environment variables read once at startup. None can be changed
 | `WACLI_MCP_STORE` | wacli's default | Store directory (exclusive with `WACLI_MCP_ACCOUNT`) |
 | `WACLI_MCP_ACCOUNT` | unset | Named wacli account |
 | `WACLI_MCP_NETWORK_ISOLATION` | `require` | `require`, `auto` or `off` |
-| `WACLI_MCP_MEDIA_DIR` | `<WACLI_MCP_STORE>/media` if it exists and is private, else unset | Directory group media is served from; unset disables `get_group_media`. An unsafe auto-detected directory only disables media; an unsafe explicit one stops startup |
+| `WACLI_MCP_MEDIA_DIR` | `<WACLI_MCP_STORE>/media` if it exists and is private, else unset | Directory group media is served from; unset disables `get_group_media`. Not allowed with `WACLI_MCP_ACCOUNTS_FILE`, where each account uses its own `<store>/media`. An unsafe auto-detected directory only disables media; an unsafe explicit one stops startup |
 | `WACLI_MCP_MAX_MEDIA_BYTES` | `3145728` | Largest photo or video returned or downloaded (64 KiB to 64 MiB). The default keeps base64 below the 5 MB per-image limit of common model APIs |
 | `WACLI_MCP_ALLOW_MEDIA_DOWNLOAD` | `0` | `1` registers `download_group_media` |
 | `WACLI_MCP_DOWNLOAD_DIR` | required with downloads | Private directory (not group- or world-writable) for downloaded copies |
@@ -229,11 +229,18 @@ How accounts are kept apart:
   environment turns sending on. `send_message` only lists accounts that have recipients.
 - **Labelled results and audit.** Results and audit entries carry the account alias.
 
-`WACLI_MCP_STORE`, `WACLI_MCP_ACCOUNT`, `WACLI_MCP_ALLOWED_CHATS`, `WACLI_MCP_DENIED_CHATS` and
-`WACLI_MCP_SEND_RECIPIENTS` cannot be combined with the file; everything else (limits, audit log, isolation, send
+`WACLI_MCP_STORE`, `WACLI_MCP_ACCOUNT`, `WACLI_MCP_ALLOWED_CHATS`, `WACLI_MCP_DENIED_CHATS`,
+`WACLI_MCP_SEND_RECIPIENTS` and `WACLI_MCP_MEDIA_DIR` cannot be combined with the file; everything else (limits, audit log, isolation, send
 confirmation) still comes from the environment and applies to all accounts. The global per-minute rate limit and
 concurrency cap are shared, while send limits are per account. Each account needs its own
 `wacli --store=<dir> sync --follow` running for fresh data and for sending.
+
+Media in multi-account mode: both media tools take `account`. Each account serves group media only from its own
+`<store>/media` directory, detected at startup like the single-account default (an unsafe one disables media for that
+account only), and applies its own chat policy. The download settings (`WACLI_MCP_ALLOW_MEDIA_DOWNLOAD`,
+`WACLI_MCP_DOWNLOAD_DIR`, size limits, `WACLI_MCP_PRLIMIT`) stay global. Saved copies are named
+`<alias>.<group digits>.<msg_id>.<ext>`, so one account is never served another account's copy of a message; the
+single-account name has no alias prefix.
 
 Adding a second wacli account without breaking the first: `wacli accounts add <name>` makes the first account it
 adds the **default**, so every wacli command run without `--store` or `--account` (including a single-account
