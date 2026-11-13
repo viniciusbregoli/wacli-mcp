@@ -454,6 +454,11 @@ OpenBot was checked by reading the code of the installed app on 2026-11-13, with
 - OpenBot shows a form elicitation as a prompt card in the app, one question per field, so `approve` becomes a
   Yes/No question with the full prompt underneath. A skipped answer declines.
 - OpenBot answers on its own only Codex's field-less consent to run a tool, which this prompt is not.
+- Codex (checked at 0.167.0) parses the form schema before it forwards the prompt, and accepts only `$schema`,
+  `type`, `properties` and `required` at the top, as in the MCP 2025-11-25 `requestedSchema`. Anything else makes
+  Codex answer cancel itself, before OpenBot shows a card, and the call fails with `elicitation was cancel`. The
+  approval form therefore carries only those fields. Codex's own consent to run the tool comes first and is a
+  separate card: approving it does not approve the send.
 - In a messaging thread (WhatsApp, Telegram, Slack, Discord) OpenBot cancels elicitations, so an unlisted send asked
   for from a chat is refused and nothing is sent. Use the OpenBot app.
 - OpenBot cuts prompt text at 2000 characters, which is where the prompt limit above comes from.
