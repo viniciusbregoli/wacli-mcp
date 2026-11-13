@@ -38,6 +38,8 @@ GROUP_JID_RE = re.compile(r"(?:[0-9]{5,32}|[0-9]{5,20}-[0-9]{5,20})@g\.us")
 # Sending is limited to people and groups. Channels, status and broadcast lists are excluded.
 SEND_JID_RE = re.compile(r"^[0-9]{5,20}(-[0-9]{5,20})?@(s\.whatsapp\.net|g\.us|lid)$")
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+# clientInfo.name values an operator may trust to show send approvals to a person.
+CLIENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@/:+-]{0,63}$")
 # wacli's own rule for account names (internal/config/config.go).
 WACLI_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_ACCOUNTS = 16
@@ -140,6 +142,14 @@ def _recipient_pairs(items: list[tuple[str, str]], where: str) -> tuple[tuple[st
             raise ConfigError(f"duplicate send recipient {alias!r} or {jid!r}")
         pairs.append((alias, jid))
     return tuple(pairs)
+
+
+def _client_names(raw: str) -> frozenset[str]:
+    names = frozenset(item.strip() for item in raw.split(",") if item.strip())
+    for name in names:
+        if not CLIENT_NAME_RE.match(name):
+            raise ConfigError(f"WACLI_MCP_SEND_CONFIRM_CLIENTS entries must be MCP client names, got {name!r}")
+    return names
 
 
 def _chat_allowed(jid: str, allowed: frozenset[str], denied: frozenset[str]) -> bool:
@@ -395,6 +405,10 @@ class Config:
     send_max_chars: int = 1000
     send_per_hour: int = 10
     send_timeout_s: float = 60.0
+    # Recipients outside the allowlist, each send approved by the user (WACLI_MCP_SEND_ANY_RECIPIENT=1).
+    send_any_recipient: bool = False
+    # clientInfo names verified to show elicitation prompts to a person; unlisted sends need one of them.
+    send_confirm_clients: frozenset[str] = frozenset()
     # File sending (off unless WACLI_MCP_ENABLE_SEND_FILES=1 on top of sending).
     send_files_enabled: bool = False
     send_file_dir: Path | None = None  # the outbox: the only place files can be sent from
@@ -547,8 +561,24 @@ class Config:
 
         send_enabled = _flag(env, "WACLI_MCP_ENABLE_SEND")
         send_recipients = _recipients(env.get("WACLI_MCP_SEND_RECIPIENTS", ""))
+        confirmation = env.get("WACLI_MCP_SEND_CONFIRMATION", "elicit").strip().lower() or "elicit"
+        if confirmation not in ("elicit", "none"):
+            raise ConfigError("WACLI_MCP_SEND_CONFIRMATION must be elicit or none")
+        any_recipient = _flag(env, "WACLI_MCP_SEND_ANY_RECIPIENT")
+        confirm_clients = _client_names(env.get("WACLI_MCP_SEND_CONFIRM_CLIENTS", ""))
+        if any_recipient:
+            if not send_enabled:
+                raise ConfigError("WACLI_MCP_SEND_ANY_RECIPIENT=1 requires WACLI_MCP_ENABLE_SEND=1")
+            if confirmation != "elicit":
+                # The per-send approval is the only safeguard left once the allowlist is bypassed.
+                raise ConfigError("WACLI_MCP_SEND_ANY_RECIPIENT=1 requires WACLI_MCP_SEND_CONFIRMATION=elicit")
+            if not confirm_clients:
+                raise ConfigError(
+                    "WACLI_MCP_SEND_ANY_RECIPIENT=1 requires WACLI_MCP_SEND_CONFIRM_CLIENTS "
+                    "(the MCP client names verified to show approvals to a person)"
+                )
         if send_enabled and not accounts_file:
-            if not send_recipients:
+            if not send_recipients and not any_recipient:
                 raise ConfigError("WACLI_MCP_ENABLE_SEND=1 requires WACLI_MCP_SEND_RECIPIENTS (alias=JID pairs)")
             if store_dir is None:
                 # The running sync daemon is found through its store directory.
@@ -571,9 +601,6 @@ class Config:
                 )
             send_file_dir = _media_dir(Path(outbox_raw), "WACLI_MCP_SEND_FILE_DIR")
             send_staging_dir = _staging_dir(Path(staging_raw), send_file_dir, "WACLI_MCP_SEND_STAGING_DIR")
-        confirmation = env.get("WACLI_MCP_SEND_CONFIRMATION", "elicit").strip().lower() or "elicit"
-        if confirmation not in ("elicit", "none"):
-            raise ConfigError("WACLI_MCP_SEND_CONFIRMATION must be elicit or none")
 
         base = cls(
             wacli_bin=wacli_bin,
@@ -603,6 +630,8 @@ class Config:
             send_max_chars=_int(env, "WACLI_MCP_SEND_MAX_CHARS", 1000, 1, 4096),
             send_per_hour=_int(env, "WACLI_MCP_SEND_PER_HOUR", 10, 1, 60),
             send_timeout_s=_float(env, "WACLI_MCP_SEND_TIMEOUT_S", 60.0, 10.0, 300.0),
+            send_any_recipient=any_recipient,
+            send_confirm_clients=confirm_clients if any_recipient else frozenset(),
             send_files_enabled=send_files,
             send_file_dir=send_file_dir,
             send_staging_dir=send_staging_dir,
@@ -618,6 +647,7 @@ class Config:
             base,
             alias="",
             send_enabled=any(v.send_enabled for v in views),
+            send_any_recipient=any(v.send_any_recipient for v in views),
             send_files_enabled=base.send_files_enabled and any(v.send_enabled for v in views),
             accounts=views,
         )
@@ -627,7 +657,7 @@ class Config:
 
 
 _ACCOUNT_KEYS = frozenset({"store", "wacli_account", "label", "allowed_chats", "denied_chats", "send"})
-_SEND_KEYS = frozenset({"recipients"})
+_SEND_KEYS = frozenset({"recipients", "any_recipient"})
 
 
 def _read_private_toml(path: Path) -> dict:
@@ -753,18 +783,26 @@ def load_accounts_file(
             raise ConfigError(f"{where}: a JID cannot be both allowed and denied")
 
         recipients: tuple[tuple[str, str], ...] = ()
+        open_recipients = False
         send = entry.get("send")
         if send is not None:
             if not isinstance(send, dict) or set(send) - _SEND_KEYS:
-                raise ConfigError(f"{where}.send only accepts a recipients table")
+                raise ConfigError(f"{where}.send only accepts a recipients table and any_recipient")
+            open_recipients = send.get("any_recipient", False)
+            if not isinstance(open_recipients, bool):
+                raise ConfigError(f"{where}.send.any_recipient must be true or false")
             raw = send.get("recipients")
-            if not isinstance(raw, dict) or not raw:
+            if raw is None and open_recipients:
+                raw = {}
+            elif not isinstance(raw, dict) or not raw:
                 raise ConfigError(f"{where}.send.recipients must be a non-empty table of alias = JID")
             recipients = _recipient_pairs(list(raw.items()), f"{where}.send.recipients")
             blocked = [jid for _, jid in recipients if not _chat_allowed(jid, allowed, denied)]
             if blocked:
                 raise ConfigError(f"{where}: send recipients hidden by the chat policy: {', '.join(blocked)}")
 
+        # Unlisted recipients need the environment switch as well as this account's own opt-in.
+        unlisted = send_switch and base.send_any_recipient and open_recipients
         views.append(
             replace(
                 base,
@@ -777,14 +815,17 @@ def load_accounts_file(
                 allowed_chats=allowed,
                 denied_chats=denied,
                 # Both switches are needed: the environment enables sending, the file says to whom.
-                send_enabled=send_switch and bool(recipients),
+                send_enabled=send_switch and (bool(recipients) or unlisted),
                 send_recipients=recipients if send_switch else (),
-                send_files_enabled=base.send_files_enabled and send_switch and bool(recipients),
+                send_any_recipient=unlisted,
+                send_files_enabled=base.send_files_enabled and send_switch and (bool(recipients) or unlisted),
                 accounts=(),
             )
         )
     if send_switch and not any(v.send_enabled for v in views):
         raise ConfigError("WACLI_MCP_ENABLE_SEND=1 requires send recipients for at least one account")
+    if base.send_any_recipient and not any(v.send_any_recipient for v in views):
+        raise ConfigError("WACLI_MCP_SEND_ANY_RECIPIENT=1 requires send.any_recipient = true for at least one account")
     return tuple(views)
 
 
