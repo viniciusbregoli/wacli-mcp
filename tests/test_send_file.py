@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import struct
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -14,8 +15,10 @@ from pathlib import Path
 import pytest
 from conftest import ADA, BOOK_CLUB, SYNTHETIC_JPEG, SYNTHETIC_MP4, FakeDaemon
 from mcp import Client
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ElicitResult
 
+from wacli_mcp import outbox
 from wacli_mcp.config import Config
 from wacli_mcp.runner import WacliError, WacliRunner
 from wacli_mcp.server import build_server
@@ -32,7 +35,22 @@ WEBP = b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 30
 MP3 = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00" * 40
 MP3_FRAME = b"\xff\xfb\x90\x00" + b"\x00" * 40
 OGG = b"OggS\x00\x02" + b"\x00" * 40
-M4A = b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 40
+
+
+def box(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", 8 + len(payload)) + kind + payload
+
+
+def iso(brand: bytes, handlers: list[bytes], moov: bool = True) -> bytes:
+    """A minimal ISO BMFF file: ftyp, then a moov with one trak per handler type, then mdat."""
+    ftyp = box(b"ftyp", brand + b"\x00\x00\x00\x00" + brand + b"isom")
+    traks = b"".join(
+        box(b"trak", box(b"mdia", box(b"hdlr", b"\x00" * 8 + handler + b"\x00" * 12 + b"\x00"))) for handler in handlers
+    )
+    return ftyp + (box(b"moov", traks) if moov else b"") + box(b"mdat", b"\x00" * 32)
+
+
+M4A = iso(b"M4A ", [b"soun"])
 ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 40
 
 
@@ -1094,3 +1112,29 @@ async def test_an_office_zip_with_too_many_entries_is_refused(fake, daemon, dirs
     fine = await send_file(server, {"recipient": "ada", "file": "fine.docx"})
     assert huge.is_error and "not a valid Office document" in text_of(huge)
     assert not fine.is_error
+
+
+@pytest.mark.parametrize("brand", [b"M4A ", b"isom", b"mp42"])
+def test_audio_only_m4a_is_accepted_whatever_its_brand(brand):
+    assert outbox.classify("a.m4a", iso(brand, [b"soun"])) == ("audio/mp4", "audio", ".m4a")
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        iso(b"M4A ", [b"soun", b"vide"]),
+        iso(b"isom", [b"vide"]),
+        iso(b"M4A ", []),
+        iso(b"M4A ", [b"soun"], moov=False),
+        b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 40,
+        b"\x00\x00\x00\x18ftypisom" + b"\xff" * 40,
+    ],
+    ids=["audio-and-video", "video-only", "no-tracks", "no-moov", "header-only", "garbage-boxes"],
+)
+def test_m4a_that_is_not_provably_audio_only_is_refused(data):
+    with pytest.raises(ToolError, match="audio-only"):
+        outbox.classify("a.m4a", data)
+
+
+def test_an_mp4_video_is_still_a_video():
+    assert outbox.classify("a.mp4", iso(b"isom", [b"vide", b"soun"]))[:2] == ("video/mp4", "video")

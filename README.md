@@ -364,7 +364,7 @@ to the checks that apply to text:
   refuses any `--file` outside it.
 
 Allowed types are decided by the file's content, and the extension must agree with it (case does not matter):
-JPEG (`.jpg`, `.jpeg`), PNG, WebP, MP4, MP3, OGG and Opus (`.ogg`, `.opus`), M4A, PDF, plain text (`.txt`, `.csv`,
+JPEG (`.jpg`, `.jpeg`), PNG, WebP, MP4, MP3, OGG and Opus (`.ogg`, `.opus`), M4A (audio-only MP4), PDF, plain text (`.txt`, `.csv`,
 `.md`, which must be valid UTF-8 without NUL bytes), and Word, Excel and PowerPoint files (`.docx`, `.xlsx`,
 `.pptx`). Anything else is refused with the list of allowed types. The server always passes `--mime` and `--as`
 explicitly, so wacli does not guess. An optional `caption` follows the same rules as a text message and is not
@@ -428,6 +428,8 @@ wacli's read commands work while `sync --follow` holds the store lock.
 - The type check looks at the first bytes and, for text, the whole file. An Office document must be a zip archive
   with `[Content_Types].xml` and at least one member under `word/`, `xl/` or `ppt/` (matching its extension) and at
   most 10000 entries; only the zip directory is read, nothing is extracted. Its content is not otherwise inspected.
+  An `.m4a` file is accepted whatever its MP4 brand (`M4A `, `isom`, `mp42`) when its track handlers show at least
+  one audio track and no video track; an MP4 video renamed to `.m4a` is refused.
 - The server checks the outbox and staging directories themselves at startup, not their parents. A parent that
   another local user can write to lets them swap either directory afterwards, so the parents must be trusted too.
 - Error text from wacli is cleaned of the staging path, the staged name and the file name before the model sees it.

@@ -198,6 +198,50 @@ def _check_ooxml(data: bytes, directory: str) -> None:
         raise ToolError("the file is not a valid Office document")
 
 
+_M4A_REFUSED = "an .m4a file must be audio-only: an MP4 container with an audio track and no video track"
+MAX_ISO_BOXES = 10_000
+
+
+def _iso_boxes(data: bytes, start: int, end: int, budget: list[int]):
+    """Yield (type, payload start, box end) for the ISO BMFF boxes in data[start:end]; malformed sizes refuse."""
+    while start < end:
+        budget[0] -= 1
+        if budget[0] < 0 or start + 8 > end:
+            raise ToolError(_M4A_REFUSED)
+        size, kind, header = int.from_bytes(data[start : start + 4]), data[start + 4 : start + 8], 8
+        if size == 1:
+            if start + 16 > end:
+                raise ToolError(_M4A_REFUSED)
+            size, header = int.from_bytes(data[start + 8 : start + 16]), 16
+        elif size == 0:
+            size = end - start
+        if size < header or start + size > end:
+            raise ToolError(_M4A_REFUSED)
+        yield kind, start + header, start + size
+        start += size
+
+
+def _check_audio_only(data: bytes) -> None:
+    """The brand of an MP4 file says little (many AAC files use isom or mp42), so the track handlers decide."""
+    budget = [MAX_ISO_BOXES]
+    handlers: list[bytes] = []
+    for kind, start, end in _iso_boxes(data, 0, len(data), budget):
+        if kind != b"moov":
+            continue
+        for trak, t_start, t_end in _iso_boxes(data, start, end, budget):
+            if trak != b"trak":
+                continue
+            for mdia, m_start, m_end in _iso_boxes(data, t_start, t_end, budget):
+                if mdia != b"mdia":
+                    continue
+                for hdlr, h_start, h_end in _iso_boxes(data, m_start, m_end, budget):
+                    # hdlr payload: version and flags (4), pre_defined (4), handler_type (4).
+                    if hdlr == b"hdlr" and h_end - h_start >= 12:
+                        handlers.append(data[h_start + 8 : h_start + 12])
+    if b"soun" not in handlers or b"vide" in handlers:
+        raise ToolError(_M4A_REFUSED)
+
+
 def classify(name: str, data: bytes) -> tuple[str, str, str]:
     """Return (mime, wacli kind, extension) when name and content agree on an allowed type."""
     ext = os.path.splitext(name)[1].lower()
@@ -215,6 +259,9 @@ def classify(name: str, data: bytes) -> tuple[str, str, str]:
         return declared[0], declared[1], ext
     if declared is None:
         raise ToolError(f"this file type is not allowed; allowed types: {ALLOWED_TYPES}")
+    if declared[0] == "audio/mp4" and data[4:8] == b"ftyp":
+        _check_audio_only(data)
+        return declared[0], declared[1], ext
     matches = declared[0] in _OOXML_MIMES if sniffed == _ZIP else declared[0] == sniffed
     if not matches:
         raise ToolError("the file extension does not match the file content")
