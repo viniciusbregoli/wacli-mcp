@@ -150,7 +150,7 @@ All settings are environment variables read once at startup. None can be changed
 | `WACLI_MCP_MEDIA_DIR` | `<WACLI_MCP_STORE>/media` if it exists and is private, else unset | Directory group media is served from; unset disables `get_group_media`. Not allowed with `WACLI_MCP_ACCOUNTS_FILE`, where each account uses its own `<store>/media`. An unsafe auto-detected directory only disables media; an unsafe explicit one stops startup |
 | `WACLI_MCP_MAX_MEDIA_BYTES` | `3145728` | Largest photo or video returned or downloaded (64 KiB to 64 MiB). The default keeps base64 below the 5 MB per-image limit of common model APIs |
 | `WACLI_MCP_ALLOW_MEDIA_DOWNLOAD` | `0` | `1` registers `download_group_media` |
-| `WACLI_MCP_DOWNLOAD_DIR` | required with downloads | Private directory (not group- or world-writable) for downloaded copies |
+| `WACLI_MCP_DOWNLOAD_DIR` | required with downloads | Directory for downloaded copies: owned by you, mode 700, with trusted parents (see Limitations) |
 | `WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES` | `1073741824` | Total size of the download directory after which new downloads are refused |
 | `WACLI_MCP_PRLIMIT` | `/usr/bin/prlimit` | util-linux `prlimit`, required with downloads; caps the size of the file the download child writes |
 | `WACLI_MCP_ALLOWED_CHATS` | unset | Comma-separated JIDs; when set, only these chats are visible |
@@ -320,7 +320,7 @@ archive, so a message passes all of these, in order, before wacli is run:
    recipient and the exact text (MCP elicitation) and nothing is sent unless they approve. Clients without
    elicitation support get an error and nothing is sent.
 
-Outcomes are reported honestly. If wacli times out or says the message may still have gone through, the tool
+Outcomes are reported honestly. If wacli times out, exits without a JSON reply, or says the message may still have gone through, the tool
 says the outcome is unknown, tells the model not to retry, and blocks the same text for 10 minutes. The audit log
 records the recipient alias, character count and outcome of every attempt, including refused ones, and never the
 text.
@@ -433,7 +433,8 @@ wacli's read commands work while `sync --follow` holds the store lock.
 - The server checks the outbox and staging directories themselves at startup, not their parents. A parent that
   another local user can write to lets them swap either directory afterwards, so the parents must be trusted too.
 - Error text from wacli is cleaned of the staging path, the staged name and the file name before the model sees it.
-- If wacli times out, or says the file may still have gone through, `send_file` reports that the outcome is unknown,
+- If wacli times out, says the file may still have gone through, overflows its output cap or exits without a JSON
+  reply, `send_file` reports that the outcome is unknown,
   tells the model not to retry and blocks the same file and caption for 10 minutes, as for text.
 - Delivery is not confirmed. A successful `send_message` means WhatsApp accepted the message, not that the
   recipient's phone received it.
@@ -443,8 +444,20 @@ wacli's read commands work while `sync --follow` holds the store lock.
   to those hosts; it relies on wacli's read-only download path, which was verified with wacli 0.25.1. Re-check after
   upgrading wacli. Media older than WhatsApp's retention may fail with an HTTP error; recovering it would need
   `--retry-on-phone`, which contacts the phone and is deliberately not offered.
-- The declared size is the sender's claim. If it understates the file, wacli still fetches until `RLIMIT_FSIZE`
-  stops it, so at most about 1 MiB over the limit is transferred and written before the call fails.
+- The declared size is the sender's claim. If it understates the file, wacli 0.25.1 still transfers it and buffers
+  the encrypted bytes in memory, up to its own fixed 100 MiB HTTP limit, before writing anything. `RLIMIT_FSIZE`
+  only caps what is written to disk (about 1 MiB over the limit), so an understated size can cost up to about
+  100 MiB of transfer and memory in the wacli child before the call fails.
+- The media, download, outbox and staging directories are checked together with all their parents: each parent must
+  be owned by you or root, and must not be writable by others unless it is sticky (such as `/tmp`). A parent may be
+  group-writable only when that group is your own private group, which no other account belongs to (as with
+  `~/.local` and `~/.local/state` on many systems). Otherwise another local user could swap a directory after
+  startup. An unsafe auto-detected `<store>/media` only disables media; the explicit settings stop startup. The
+  download directory and the staging directory also need mode 700 and your ownership; media directories may be
+  readable by others.
+- The download directory's capacity is checked again under a lock (`.capacity.lock`, kept in the directory) just
+  before each save, with the real size of the file, so several server processes sharing it cannot together pass
+  `WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES`.
 - Saved copies stay until removed by hand, even after the original message is deleted; they are only no longer
   served. Delete files from `WACLI_MCP_DOWNLOAD_DIR` to get rid of them.
 - The server cannot prove that the bytes wacli downloads belong to the checked message (wacli's JSON has no content
