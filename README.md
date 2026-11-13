@@ -51,6 +51,10 @@ With sending enabled (see [Sending](#sending)) one more tool appears:
 
 It carries `readOnlyHint: false`, `idempotentHint: false` and `openWorldHint: true`.
 
+File sending (see [Sending files](#sending-files)) is a second opt-in that adds `send_file`, which sends one file
+from a directory you set aside (the outbox) with `send file --to=<configured JID> --file=<staged copy>`. It carries
+the same hints as `send_message`.
+
 With several accounts configured (see [Multiple accounts](#multiple-accounts)), every tool takes a required
 `account` argument limited to the configured aliases. With one account, tool signatures are unchanged.
 
@@ -172,6 +176,15 @@ Sending only (see [Sending](#sending)):
 | `WACLI_MCP_SEND_PER_HOUR` | `10` | Sends per rolling hour (1 to 60) |
 | `WACLI_MCP_SEND_TIMEOUT_S` | `60` | Time allowed for one send (10 to 300) |
 
+File sending only (see [Sending files](#sending-files)):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WACLI_MCP_ENABLE_SEND_FILES` | unset | `1` registers `send_file`; requires sending and the two directories below |
+| `WACLI_MCP_SEND_FILE_DIR` | | The outbox: an absolute, existing directory owned by you or root and not writable by group or others. The only place files can be sent from |
+| `WACLI_MCP_SEND_STAGING_DIR` | | An absolute, existing directory owned by you with mode 700, outside the outbox. The server writes the approved copy here and the sync daemon reads it from here |
+| `WACLI_MCP_SEND_FILE_MAX_BYTES` | `16777216` | Largest file accepted (1024 to 104857600) |
+
 HTTP transport only:
 
 | Variable | Default | Meaning |
@@ -227,6 +240,8 @@ How accounts are kept apart:
   account is refused when sending from another.
 - **Two switches for sending.** The file says who each account may message, and `WACLI_MCP_ENABLE_SEND=1` in the
   environment turns sending on. `send_message` only lists accounts that have recipients.
+- **Files.** `WACLI_MCP_ENABLE_SEND_FILES=1` and its directories are global: one outbox and one staging directory
+  serve every account that can send. Recipients, the hourly limit and the duplicate guard stay per account.
 - **Labelled results and audit.** Results and audit entries carry the account alias.
 
 `WACLI_MCP_STORE`, `WACLI_MCP_ACCOUNT`, `WACLI_MCP_ALLOWED_CHATS`, `WACLI_MCP_DENIED_CHATS`,
@@ -327,6 +342,61 @@ claude mcp add whatsapp --scope user \
 
 `archive_health` reports `send_ready: true` once the daemon is running for that store.
 
+## Sending files
+
+`send_file` sends one file to a recipient from the same allowlist as `send_message`. It is off unless you also set
+`WACLI_MCP_ENABLE_SEND_FILES=1` on top of `WACLI_MCP_ENABLE_SEND=1` (with recipients). It adds two pieces of design
+to the checks that apply to text:
+
+- **An outbox.** `file` is a path relative to `WACLI_MCP_SEND_FILE_DIR`, and nothing outside that directory can be
+  sent. Absolute paths, `..`, hidden names (starting with `.`) and control or invisible characters are refused before
+  the filesystem is touched, and each directory level is opened without following symlinks. The file must be a
+  regular, non-empty file within `WACLI_MCP_SEND_FILE_MAX_BYTES`. Whoever can write to the outbox chooses what can
+  be sent, so keep it dedicated to this and do not point it at a home directory.
+- **A staging directory.** The server reads the file once, shows you its checksum, and writes exactly those bytes to
+  a random name in `WACLI_MCP_SEND_STAGING_DIR`. wacli is then pointed at that copy, not at the outbox, so the file
+  cannot change between the approval and the send. The copy is removed after every attempt, whatever the outcome.
+  The server also sets `WACLI_MEDIA_ROOTS` to the staging directory for that one wacli call, so wacli's own check
+  refuses any `--file` outside it.
+
+Allowed types are decided by the file's content, and the extension must agree with it (case does not matter):
+JPEG (`.jpg`, `.jpeg`), PNG, WebP, MP4, MP3, OGG and Opus (`.ogg`, `.opus`), M4A, PDF, plain text (`.txt`, `.csv`,
+`.md`, which must be valid UTF-8 without NUL bytes), and Word, Excel and PowerPoint files (`.docx`, `.xlsx`,
+`.pptx`). Anything else is refused with the list of allowed types. The server always passes `--mime` and `--as`
+explicitly, so wacli does not guess. An optional `caption` follows the same rules as a text message and is not
+accepted for audio.
+
+With the default `WACLI_MCP_SEND_CONFIRMATION=elicit`, the client shows you the recipient, the file name, its type,
+its size in bytes, its full SHA-256 and the caption. You do not see the content itself, so approve only a file you
+asked for. If the file changes after the prompt was built, the server asks again with the new checksum, or refuses
+with "the file changed after it was shown for confirmation" and sends nothing.
+
+Files share the hourly limit (`WACLI_MCP_SEND_PER_HOUR`) and the duplicate guard with `send_message`. The duplicate
+guard keys on the recipient, the file's checksum and the caption, so a renamed copy of a file that was just sent is
+refused too. The audit log records the recipient alias, the byte count, the MIME type and the outcome, and never
+the path, file name, caption or checksum.
+
+Daemon requirements: the sync daemon reads the staged copy itself, as the same user that runs this server, so it
+must be able to read `WACLI_MCP_SEND_STAGING_DIR`. If the daemon runs with `WACLI_MEDIA_ROOTS` set, the staging
+directory must be inside one of its roots. Without a running `wacli sync --follow` nothing is staged or sent.
+
+Example, adding files to the setup above:
+
+```sh
+mkdir -p "$HOME/whatsapp-outbox" && chmod 700 "$HOME/whatsapp-outbox"
+mkdir -p "$HOME/.local/state/wacli-mcp/staging" && chmod 700 "$HOME/.local/state/wacli-mcp/staging"
+claude mcp add whatsapp --scope user \
+  --env WACLI_MCP_STORE="$HOME/.local/state/wacli" \
+  --env WACLI_MCP_ENABLE_SEND=1 \
+  --env WACLI_MCP_SEND_RECIPIENTS="me=15551234567@s.whatsapp.net" \
+  --env WACLI_MCP_ENABLE_SEND_FILES=1 \
+  --env WACLI_MCP_SEND_FILE_DIR="$HOME/whatsapp-outbox" \
+  --env WACLI_MCP_SEND_STAGING_DIR="$HOME/.local/state/wacli-mcp/staging" \
+  -- wacli-mcp stdio
+```
+
+`archive_health` reports `send_files_enabled` and `send_file_max_bytes` next to the other send settings.
+
 ## Keeping the archive fresh
 
 This server never syncs. Results describe what wacli has stored; message results (`list_messages`,
@@ -346,7 +416,14 @@ wacli's read commands work while `sync --follow` holds the store lock.
   should never leave the machine.
 - wacli's JSON fields are not a formal API. Integration tests pin the behaviour of the tested version; run them
   after upgrading wacli.
-- Sending is plain text only: no files, replies, mentions or link previews.
+- `send_message` is plain text only: no replies, mentions or link previews. `send_file` sends one file per call
+  with an optional caption; it does not send voice notes, stickers, replies or link previews.
+- A file is held in memory while it is checked and sent, so `WACLI_MCP_SEND_FILE_MAX_BYTES` bounds the memory
+  one call needs (at most 100 MiB).
+- The type check looks at the first bytes and, for text, the whole file. An Office document is recognised as a zip
+  archive plus its extension; its inner structure is not inspected.
+- If wacli times out, or says the file may still have gone through, `send_file` reports that the outcome is unknown,
+  tells the model not to retry and blocks the same file and caption for 10 minutes, as for text.
 - Delivery is not confirmed. A successful `send_message` means WhatsApp accepted the message, not that the
   recipient's phone received it.
 - Without `WACLI_MCP_ALLOW_MEDIA_DOWNLOAD=1`, media is served only if it is already in the store's media
