@@ -198,6 +198,19 @@ def _check_ooxml(data: bytes, directory: str) -> None:
     disk_entries, entries, size, offset = struct.unpack_from("<HHII", tail, at + 8)
     if 0xFFFF in (disk_entries, entries) or 0xFFFFFFFF in (size, offset) or entries > MAX_ZIP_ENTRIES:
         raise ToolError("the file is not a valid Office document")
+    # The count alone does not bound what zipfile parses: it reads every record in the declared directory size.
+    # Walk at most `entries` record headers and require that they end exactly at the end record.
+    end = len(data) - len(tail) + at
+    pos = end - size
+    if pos < 0:
+        raise ToolError("the file is not a valid Office document")
+    for _ in range(entries):
+        if pos + 46 > end or data[pos : pos + 4] != b"PK\x01\x02":
+            raise ToolError("the file is not a valid Office document")
+        name_len, extra_len, comment_len = struct.unpack_from("<HHH", data, pos + 28)
+        pos += 46 + name_len + extra_len + comment_len
+    if pos != end:
+        raise ToolError("the file is not a valid Office document")
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = zf.namelist()

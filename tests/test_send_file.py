@@ -1296,3 +1296,23 @@ def test_the_duplicate_window_starts_when_a_send_finishes():
     asyncio.run(_deliver(sender, "k", {}, slow_send))
     with pytest.raises(ToolError, match="already sent"):
         guard.check("k", "file")
+
+
+def test_a_central_directory_longer_than_its_end_record_claims_is_refused_unopened(dirs, monkeypatch):
+    outbox_dir, _ = dirs
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<xml/>")
+        for i in range(50):
+            zf.writestr(f"word/part{i}.xml", "<xml/>")
+    data = bytearray(buf.getvalue())
+    eocd = data.rindex(b"PK\x05\x06")
+    data[eocd + 8 : eocd + 12] = (2).to_bytes(2, "little") * 2  # claims 2 entries, holds 51
+    write(outbox_dir, "short.docx", bytes(data))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("zipfile.ZipFile must not be constructed")
+
+    monkeypatch.setattr(outbox.zipfile, "ZipFile", forbidden)
+    with pytest.raises(ToolError, match="not a valid Office document"):
+        outbox.load(outbox_dir, "short.docx", 1 << 20)
