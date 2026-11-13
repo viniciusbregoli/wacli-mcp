@@ -216,7 +216,9 @@ class WacliRunner:
             message = "wacli returned output that is not a JSON envelope"
         else:
             message = f"wacli exited with status {returncode}"
-        raise WacliError(sanitize_text(message, MAX_ERROR_CHARS))
+        # Without an error from wacli itself the outcome is unknown: it may have died after doing the work.
+        kind = "wacli_error" if envelope is not None and envelope.get("error") else "protocol"
+        raise WacliError(sanitize_text(message, MAX_ERROR_CHARS), kind=kind)
 
 
 async def _read_capped(stream: asyncio.StreamReader, cap: int, on_overflow: Callable[[], None] | None = None) -> bytes:
