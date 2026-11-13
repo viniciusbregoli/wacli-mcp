@@ -183,6 +183,26 @@ def _media_dir(path: Path, what: str) -> Path:
     return resolved
 
 
+def _staging_dir(path: Path, outbox: Path, what: str) -> Path:
+    """Vet the private directory approved file snapshots are written to and return its resolved form."""
+    if not path.is_absolute():
+        raise ConfigError(f"{what} must be absolute")
+    if not path.is_dir():
+        raise ConfigError(f"{what} does not exist or is not a directory: {path}")
+    resolved = path.resolve(strict=True)
+    st = resolved.stat()
+    if st.st_uid != os.getuid():
+        raise ConfigError(f"{what} {resolved} must be owned by the current user")
+    if st.st_mode & 0o077:
+        raise ConfigError(f"{what} {resolved} must not be accessible by group or others (chmod 700)")
+    if resolved == outbox or outbox in resolved.parents or resolved in outbox.parents:
+        raise ConfigError(f"{what} must not be the outbox, inside it, or contain it")
+    if os.pathsep in str(resolved):
+        # The path goes into WACLI_MEDIA_ROOTS, a list separated by this character.
+        raise ConfigError(f"{what} must not contain {os.pathsep!r}")
+    return resolved
+
+
 def _auto_media_dir(store_dir: Path | None) -> Path | None:
     """The store's own media directory, if it has one that passes the checks.
 
@@ -247,6 +267,11 @@ class Config:
     send_max_chars: int = 1000
     send_per_hour: int = 10
     send_timeout_s: float = 60.0
+    # File sending (off unless WACLI_MCP_ENABLE_SEND_FILES=1 on top of sending).
+    send_files_enabled: bool = False
+    send_file_dir: Path | None = None  # the outbox: the only place files can be sent from
+    send_staging_dir: Path | None = None  # where the approved snapshot is written for wacli and the daemon
+    send_file_max_bytes: int = 16 * 1024 * 1024
     # Multi-account mode: one view per account, each a copy of this config with
     # that account's store, chat policy and recipients. Empty in single-account mode.
     alias: str = DEFAULT_ALIAS
@@ -403,6 +428,21 @@ class Config:
             blocked = [jid for _, jid in send_recipients if not _chat_allowed(jid, allowed, denied)]
             if blocked:
                 raise ConfigError(f"send recipients hidden by the chat policy: {', '.join(blocked)}")
+        send_files = _flag(env, "WACLI_MCP_ENABLE_SEND_FILES")
+        send_file_dir = send_staging_dir = None
+        if send_files:
+            if not send_enabled:
+                raise ConfigError("WACLI_MCP_ENABLE_SEND_FILES=1 requires WACLI_MCP_ENABLE_SEND=1 and send recipients")
+            outbox_raw = env.get("WACLI_MCP_SEND_FILE_DIR", "").strip()
+            staging_raw = env.get("WACLI_MCP_SEND_STAGING_DIR", "").strip()
+            if not outbox_raw:
+                raise ConfigError("WACLI_MCP_ENABLE_SEND_FILES=1 requires WACLI_MCP_SEND_FILE_DIR (the outbox)")
+            if not staging_raw:
+                raise ConfigError(
+                    "WACLI_MCP_ENABLE_SEND_FILES=1 requires WACLI_MCP_SEND_STAGING_DIR (a private directory)"
+                )
+            send_file_dir = _media_dir(Path(outbox_raw), "WACLI_MCP_SEND_FILE_DIR")
+            send_staging_dir = _staging_dir(Path(staging_raw), send_file_dir, "WACLI_MCP_SEND_STAGING_DIR")
         confirmation = env.get("WACLI_MCP_SEND_CONFIRMATION", "elicit").strip().lower() or "elicit"
         if confirmation not in ("elicit", "none"):
             raise ConfigError("WACLI_MCP_SEND_CONFIRMATION must be elicit or none")
@@ -435,12 +475,22 @@ class Config:
             send_max_chars=_int(env, "WACLI_MCP_SEND_MAX_CHARS", 1000, 1, 4096),
             send_per_hour=_int(env, "WACLI_MCP_SEND_PER_HOUR", 10, 1, 60),
             send_timeout_s=_float(env, "WACLI_MCP_SEND_TIMEOUT_S", 60.0, 10.0, 300.0),
+            send_files_enabled=send_files,
+            send_file_dir=send_file_dir,
+            send_staging_dir=send_staging_dir,
+            send_file_max_bytes=_int(env, "WACLI_MCP_SEND_FILE_MAX_BYTES", 16 * 1024 * 1024, 1024, 100 * 1024 * 1024),
         )
         if not accounts_file:
             return base
         views = load_accounts_file(Path(accounts_file), base, send_switch=send_enabled, env=env)
         # The top level keeps no store or policy of its own: every call goes through a view.
-        return replace(base, alias="", send_enabled=any(v.send_enabled for v in views), accounts=views)
+        return replace(
+            base,
+            alias="",
+            send_enabled=any(v.send_enabled for v in views),
+            send_files_enabled=base.send_files_enabled and any(v.send_enabled for v in views),
+            accounts=views,
+        )
 
 
 _ACCOUNT_KEYS = frozenset({"store", "wacli_account", "label", "allowed_chats", "denied_chats", "send"})
@@ -596,6 +646,7 @@ def load_accounts_file(
                 # Both switches are needed: the environment enables sending, the file says to whom.
                 send_enabled=send_switch and bool(recipients),
                 send_recipients=recipients if send_switch else (),
+                send_files_enabled=base.send_files_enabled and send_switch and bool(recipients),
                 accounts=(),
             )
         )
