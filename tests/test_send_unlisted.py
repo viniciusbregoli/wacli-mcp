@@ -6,6 +6,7 @@ Nothing here can reach WhatsApp. Every unlisted send needs a verified per-send a
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -740,3 +741,78 @@ def test_server_instructions_mention_unlisted_sends_only_when_enabled(fake):
     assert "outside that list" in _instructions(open_config(fake), downloads_enabled=False)
     plain = fake.config(send_enabled=True, send_recipients=RECIPIENTS)
     assert "outside that list" not in _instructions(plain, downloads_enabled=False)
+
+
+# Codex as OpenBot runs it
+
+CODEX = "codex-mcp-client"
+# The form requestedSchema shape Codex's app-server parses (MCP 2025-11-25), with unknown fields refused.
+FORM_KEYS = {"$schema", "type", "properties", "required"}
+BOOLEAN_KEYS = {"type", "title", "description", "default"}
+
+
+class CodexUser:
+    """Codex's app-server, then OpenBot's card, then a person who taps Yes.
+
+    Codex answers cancel by itself, before any card, when the schema does not parse.
+    """
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+        self.schemas: list[dict] = []
+
+    async def __call__(self, context, params):
+        schema = params.requested_schema
+        self.schemas.append(schema)
+        properties = schema.get("properties", {})
+        if (
+            set(schema) - FORM_KEYS
+            or schema.get("type") != "object"
+            or any(set(p) - BOOLEAN_KEYS or p.get("type") != "boolean" for p in properties.values())
+        ):
+            return ElicitResult(action="cancel")
+        self.prompts.append(params.message)
+        return ElicitResult(action="accept", content={name: True for name in properties})
+
+
+def codex_config(fake, tmp_path) -> Config:
+    return replace(file_config(fake, tmp_path), send_confirm_clients=frozenset({CODEX}))
+
+
+async def codex_call(server, tool, args, user):
+    # Codex connects with the initialize handshake, so prompts travel as elicitation/create requests.
+    info = Implementation(name=CODEX, version="0.167.0")
+    async with Client(server, elicitation_callback=user, client_info=info, mode="legacy") as client:
+        return await client.call_tool(tool, args)
+
+
+@pytest.mark.parametrize("recipient", ["ada", NUMBER])
+async def test_codex_shows_the_text_approval_and_the_send_goes_through(fake, daemon, tmp_path, recipient):
+    fake.respond(SENT)
+    user = CodexUser()
+    result = await codex_call(
+        build_server(codex_config(fake, tmp_path)), "send_message", {"recipient": recipient, "text": "hi"}, user
+    )
+    assert not result.is_error, result.content
+    assert result.structured_content["sent"] is True
+    (schema,) = user.schemas
+    assert set(schema) <= FORM_KEYS and schema["required"] == ["approve"]
+    (prompt,) = user.prompts
+    assert "hi" in prompt
+    assert len(fake.calls()) == 1
+
+
+@pytest.mark.parametrize("recipient", ["ada", NUMBER])
+async def test_codex_shows_the_file_approval_and_the_send_goes_through(fake, daemon, tmp_path, recipient):
+    cfg = codex_config(fake, tmp_path)
+    (cfg.send_file_dir / "photo.jpg").write_bytes(SYNTHETIC_JPEG)
+    fake.respond(SENT)
+    user = CodexUser()
+    result = await codex_call(build_server(cfg), "send_file", {"recipient": recipient, "file": "photo.jpg"}, user)
+    assert not result.is_error, result.content
+    assert result.structured_content["sent"] is True
+    (schema,) = user.schemas
+    assert set(schema) <= FORM_KEYS
+    (prompt,) = user.prompts
+    assert "photo.jpg" in prompt
+    assert len(fake.calls()) == 1
