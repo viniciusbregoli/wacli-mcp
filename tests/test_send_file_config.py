@@ -189,3 +189,57 @@ def test_multi_account_files_need_text_sending(fake, tmp_path):
     del env["WACLI_MCP_ENABLE_SEND"]
     with pytest.raises(ConfigError, match="requires WACLI_MCP_ENABLE_SEND=1"):
         Config.from_env(env)
+
+
+# Overlap with data the server already reads or writes
+
+
+OVERLAP = "must not equal, contain, or be inside"
+
+
+def protected_env(fake, tmp_path, protected: str, base: Path) -> dict[str, str]:
+    if protected == "store":
+        extra = {"WACLI_MCP_STORE": str(base)}
+    elif protected == "media":
+        extra = {"WACLI_MCP_MEDIA_DIR": str(base)}
+    else:
+        extra = {"WACLI_MCP_ALLOW_MEDIA_DOWNLOAD": "1", "WACLI_MCP_DOWNLOAD_DIR": str(base)}
+    return env_for(fake, tmp_path, **extra)
+
+
+@pytest.mark.parametrize("which", ["WACLI_MCP_SEND_FILE_DIR", "WACLI_MCP_SEND_STAGING_DIR"])
+@pytest.mark.parametrize("relation", ["equal", "inside", "contains"])
+@pytest.mark.parametrize("protected", ["store", "media", "download"])
+def test_send_directories_stay_apart_from_other_data(fake, tmp_path, which, relation, protected):
+    zone = private_dir(tmp_path / "zone")
+    base = private_dir(zone / "protected")
+    chosen = {"equal": base, "inside": private_dir(base / "inner"), "contains": zone}[relation]
+    env = protected_env(fake, tmp_path, protected, base)
+    env[which] = str(chosen)
+    with pytest.raises(ConfigError, match=OVERLAP):
+        Config.from_env(env)
+
+
+@pytest.mark.parametrize("which", ["WACLI_MCP_SEND_FILE_DIR", "WACLI_MCP_SEND_STAGING_DIR"])
+def test_send_directories_must_not_contain_the_audit_log(fake, tmp_path, which):
+    zone = private_dir(tmp_path / "zone")
+    env = env_for(fake, tmp_path, WACLI_MCP_AUDIT_LOG=str(zone / "audit.jsonl"))
+    env[which] = str(zone)
+    with pytest.raises(ConfigError, match="must not contain the audit log"):
+        Config.from_env(env)
+
+
+def test_unrelated_directories_are_fine(fake, tmp_path):
+    base = private_dir(tmp_path / "zone" / "protected")
+    env = protected_env(fake, tmp_path, "media", base)
+    assert Config.from_env(env).send_files_enabled
+
+
+def test_send_directories_stay_apart_from_every_account_store(fake, tmp_path):
+    env = multi_env(fake, tmp_path, ("personal",))
+    work = {**env, "WACLI_MCP_SEND_FILE_DIR": str(tmp_path / "stores" / "work")}
+    with pytest.raises(ConfigError, match=OVERLAP):
+        Config.from_env(work)
+    inside = private_dir(tmp_path / "stores" / "personal" / "stage")
+    with pytest.raises(ConfigError, match=OVERLAP):
+        Config.from_env({**env, "WACLI_MCP_SEND_STAGING_DIR": str(inside)})

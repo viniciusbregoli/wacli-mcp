@@ -36,10 +36,15 @@ M4A = b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 40
 ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 40
 
 
-def ooxml(member: str) -> bytes:
+def ooxml(member: str, content_types: bool = True, extra: int = 0) -> bytes:
+    """A minimal zip shaped like an Office document: [Content_Types].xml plus one member."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
+        if content_types:
+            zf.writestr("[Content_Types].xml", "<Types/>")
         zf.writestr(member, "<xml/>")
+        for i in range(extra):
+            zf.writestr(f"word/n{i}", "")
     return buf.getvalue()
 
 
@@ -431,12 +436,18 @@ async def test_client_without_elicitation_cannot_send_a_file(fake, daemon, dirs)
 
 
 def build_tree(outbox: Path) -> None:
+    (outbox.parent / "outside.pdf").write_bytes(PDF)
     write(outbox, "ok.pdf", PDF)
     write(outbox, "empty.pdf", b"")
     write(outbox, "big.pdf", PDF + b"x" * 4096)
     write(outbox, "prog.pdf", ELF)
     write(outbox, "prog.bin", ELF)
     write(outbox, "archive.zip", ooxml("word/document.xml"))
+    write(outbox, "evil.docx", ooxml("evil.sh"))
+    write(outbox, "nomanifest.docx", ooxml("word/document.xml", content_types=False))
+    write(outbox, "wrongdir.xlsx", ooxml("word/document.xml"))
+    write(outbox, "garbage.docx", b"PK\x03\x04 not really a zip")
+    os.link(outbox.parent / "outside.pdf", outbox / "hardlink.pdf")
     write(outbox, "photo.pdf", PNG)
     write(outbox, "latin1.txt", b"caf\xe9\n")
     write(outbox, "nul.txt", b"abc\x00def")
@@ -463,6 +474,13 @@ REFUSALS = [
     ("bad\x07name.pdf", "control or invisible"),
     ("nul\x00.pdf", "control or invisible"),
     ("bidi" + chr(0x202E) + "fdp.pdf", "control or invisible"),
+    ("a" + chr(0x2028) + ".pdf", "control or invisible"),
+    ("a" + chr(0x2029) + ".pdf", "control or invisible"),
+    ("a" + chr(0x00A0) + ".pdf", "control or invisible"),
+    ("a" + chr(0x3164) + ".pdf", "control or invisible"),
+    ("a" + chr(0x2800) + ".pdf", "control or invisible"),
+    ("a" + chr(0x115F) + ".pdf", "control or invisible"),
+    ("a" + chr(0xFFA0) + ".pdf", "control or invisible"),
     ("", "relative to the outbox"),
     ("x" * 1025, "relative to the outbox"),
     ("y" * 256 + ".pdf", "at most 255 bytes"),
@@ -479,6 +497,11 @@ REFUSALS = [
     ("prog.pdf", "type is not allowed"),
     ("noext", "type is not allowed"),
     ("archive.zip", "type is not allowed"),
+    ("evil.docx", "not a valid Office document"),
+    ("nomanifest.docx", "not a valid Office document"),
+    ("wrongdir.xlsx", "not a valid Office document"),
+    ("garbage.docx", "not a valid Office document"),
+    ("hardlink.pdf", "more than one hard link"),
     ("photo.pdf", "extension does not match"),
     ("latin1.txt", "valid UTF-8"),
     ("nul.txt", "NUL"),
@@ -854,3 +877,220 @@ def test_stale_snapshots_are_removed_at_startup_and_fresh_ones_are_kept(fake, di
     build_server(file_config(fake, dirs))
     assert not stale.exists()
     assert fresh.exists() and unrelated.exists()
+
+
+# Review fixes
+
+
+def test_files_owned_by_someone_else_are_refused(fake, dirs, monkeypatch):
+    from wacli_mcp import outbox as outbox_module
+
+    outbox, _ = dirs
+    write(outbox, "a.pdf", PDF)
+    monkeypatch.setattr(outbox_module.os, "getuid", lambda: 12345)
+    with pytest.raises(Exception, match="not owned by the server's user"):
+        outbox_module.load(outbox, "a.pdf", 1024)
+
+
+async def test_a_changed_file_cannot_ride_another_calls_approval(fake, daemon, dirs):
+    """Legacy mode, two identical concurrent calls: call 2's prompt must not vouch for call 1's bytes."""
+    outbox, staging = dirs
+    target = write(outbox, "a.pdf", PDF)
+    fake.respond(SENT)
+    first_swapped, second_asked = asyncio.Event(), asyncio.Event()
+    prompts: list[str] = []
+
+    async def user(context, params):
+        prompts.append(params.message)
+        if len(prompts) == 1:
+            target.write_bytes(PDF + b"swapped after prompt one\n")
+            first_swapped.set()
+            await asyncio.wait_for(second_asked.wait(), 10)
+            return ElicitResult(action="accept", content={"approve": True})
+        second_asked.set()
+        return ElicitResult(action="decline")
+
+    args = {"recipient": "ada", "file": "a.pdf"}
+    async with Client(build_server(file_config(fake, dirs)), elicitation_callback=user, mode="legacy") as client:
+
+        async def second():
+            await asyncio.wait_for(first_swapped.wait(), 10)
+            return await client.call_tool("send_file", args)
+
+        first, other = await asyncio.gather(client.call_tool("send_file", args), second())
+    assert len(prompts) == 2 and other.is_error
+    assert first.is_error and "the file changed after it was shown for confirmation" in text_of(first)
+    assert fake.calls() == [] and staged_leftovers(staging) == []
+
+
+async def test_tool_schema_does_not_expose_the_context(fake, dirs):
+    async with Client(build_server(file_config(fake, dirs))) as client:
+        tool = next(t for t in (await client.list_tools()).tools if t.name == "send_file")
+    assert set(tool.input_schema["properties"]) == {"recipient", "file", "caption"}
+
+
+def _sender():
+    from wacli_mcp.runner import RateLimiter
+    from wacli_mcp.sending import DuplicateGuard, _Sender
+
+    return _Sender(Config(wacli_bin=Path("/bin/true"), home=Path("/tmp")), RateLimiter(5), DuplicateGuard())
+
+
+async def test_a_cancelled_send_is_audited_as_uncertain():
+    from wacli_mcp.sending import _deliver
+
+    record: dict = {}
+    started = asyncio.Event()
+
+    async def hang():
+        started.set()
+        await asyncio.sleep(60)
+
+    task = asyncio.ensure_future(_deliver(_sender(), "k", record, hang))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert record["outcome"] == "uncertain"
+
+
+async def test_output_limit_is_an_uncertain_outcome():
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from wacli_mcp.sending import _deliver
+
+    sender, record = _sender(), {}
+
+    async def overflow():
+        raise WacliError("wacli output exceeded 10 bytes", kind="output_limit")
+
+    with pytest.raises(ToolError, match="outcome is unknown"):
+        await _deliver(sender, "k", record, overflow)
+    assert record["outcome"] == "uncertain"
+    with pytest.raises(Exception, match="already sent"):
+        sender.guard.check("k")
+
+
+class LeakyRunner(WacliRunner):
+    """Fails the way wacli can: with a message that quotes the paths it was given."""
+
+    async def run_write(self, args, target=None, *, extra_env=None):
+        file = next(a for a in args if a.startswith("--file=")).split("=", 1)[1]
+        name = next(a for a in args if a.startswith("--filename=")).split("=", 1)[1]
+        root = extra_env["WACLI_MEDIA_ROOTS"]
+        raise WacliError(f"open {file}: denied ({name} under {root}, {os.path.basename(file)})")
+
+
+async def test_wacli_error_text_carries_no_local_path(fake, daemon, dirs):
+    outbox, staging = dirs
+    write(outbox, "payroll-march.pdf", PDF)
+    server = build_server(file_config(fake, dirs, send_confirmation="none"), LeakyRunner(fake.config()))
+    result = await send_file(server, {"recipient": "ada", "file": "payroll-march.pdf"})
+    message = text_of(result)
+    assert result.is_error and "not sent: " in message
+    assert "<staging>" in message and "<file>" in message
+    assert str(staging) not in message and "payroll-march" not in message
+    assert not any(part in message for part in os.listdir(staging)) and ".pdf" not in message.replace("<file>", "")
+
+
+async def test_cancelling_a_call_while_staging_leaves_no_file(fake, daemon, dirs, monkeypatch):
+    import threading
+
+    from wacli_mcp import sending
+
+    outbox, staging = dirs
+    write(outbox, "a.pdf", PDF)
+    entered, release = threading.Event(), threading.Event()
+    real = sending._stage
+
+    def slow(path, data):
+        entered.set()
+        release.wait(10)
+        real(path, data)
+
+    monkeypatch.setattr(sending, "_stage", slow)
+    async with Client(build_server(file_config(fake, dirs, send_confirmation="none"))) as client:
+        task = asyncio.ensure_future(client.call_tool("send_file", {"recipient": "ada", "file": "a.pdf"}))
+        for _ in range(400):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.025)
+        assert entered.is_set()
+        task.cancel()
+        await asyncio.sleep(0.2)
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.5)
+    assert staged_leftovers(staging) == []
+
+
+async def test_snapshot_reads_are_limited_to_two_at_a_time(fake, daemon, dirs, monkeypatch):
+    import threading
+    import time
+
+    from wacli_mcp import outbox as outbox_module
+
+    outbox, _ = dirs
+    write(outbox, "a.png", PNG)
+    fake.respond(SENT)
+    lock, state = threading.Lock(), {"active": 0, "peak": 0}
+    real = outbox_module.load
+
+    def counted(*args):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        time.sleep(0.1)
+        try:
+            return real(*args)
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(outbox_module, "load", counted)
+    server = build_server(file_config(fake, dirs, send_confirmation="none", send_per_hour=60))
+    async with Client(server) as client:
+        await asyncio.gather(
+            *(
+                client.call_tool("send_file", {"recipient": "ada", "file": "a.png", "caption": f"c{i}"})
+                for i in range(6)
+            )
+        )
+    assert state["peak"] <= 2
+
+
+async def test_a_refusal_in_the_send_step_is_audited_without_arguments(fake, daemon, dirs, tmp_path):
+    # The prompt passes, then the file disappears before the send re-checks it (handshake-era protocol).
+    outbox, _ = dirs
+    target = write(outbox, "secret-name.pdf", PDF)
+    log = tmp_path / "audit.jsonl"
+    user = User(before_answer=target.unlink)
+    server = build_server(file_config(fake, dirs, audit_log=log))
+    result = await send_file(server, {"recipient": "ada", "file": "secret-name.pdf"}, user, mode="legacy")
+    assert result.is_error
+    (entry,) = [json.loads(line) for line in log.read_text().splitlines()]
+    assert entry == {**entry, "tool": "send_file", "outcome": "rejected", "stage": "send"}
+    assert "recipient" not in entry and "secret-name" not in log.read_text()
+
+
+async def test_a_text_refusal_in_the_send_step_is_audited_as_send_stage(fake, daemon, dirs, tmp_path):
+    log = tmp_path / "audit.jsonl"
+    user = User(before_answer=daemon.stop)
+    server = build_server(file_config(fake, dirs, audit_log=log))
+    async with Client(server, elicitation_callback=user, mode="legacy") as client:
+        result = await client.call_tool("send_message", {"recipient": "ada", "text": "hi"})
+    assert result.is_error
+    (entry,) = [json.loads(line) for line in log.read_text().splitlines()]
+    assert entry["tool"] == "send_message" and entry["outcome"] == "rejected" and entry["stage"] == "send"
+
+
+async def test_an_office_zip_with_too_many_entries_is_refused(fake, daemon, dirs):
+    outbox, _ = dirs
+    write(outbox, "huge.docx", ooxml("word/document.xml", extra=10000))
+    write(outbox, "fine.docx", ooxml("word/document.xml", extra=100))
+    fake.respond(SENT)
+    server = build_server(file_config(fake, dirs, send_confirmation="none"))
+    huge = await send_file(server, {"recipient": "ada", "file": "huge.docx"})
+    fine = await send_file(server, {"recipient": "ada", "file": "fine.docx"})
+    assert huge.is_error and "not a valid Office document" in text_of(huge)
+    assert not fine.is_error
