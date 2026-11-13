@@ -61,6 +61,10 @@ _SEND_INTRO = (
     "Read access to the owner's locally synced WhatsApp archive (wacli), plus `send_message`, which "
     "sends plain text to a fixed list of pre-approved recipients. "
 )
+_SEND_ANY = (
+    "It can also send to a number or group outside that list, but only after the user approves that exact "
+    "send in a prompt; a declined or cancelled prompt means nothing is sent. "
+)
 _SEND_FILES = (
     "`send_file` sends one file from the operator's outbox directory to the same recipients; "
     "nothing outside that outbox can be sent. "
@@ -186,6 +190,8 @@ def _media_result(meta: dict[str, Any], media_type: str, mime: str, encoded: str
 def _instructions(cfg: Config, downloads_enabled: bool) -> str:
     """Server instructions that match exactly which tools are registered."""
     intro = _SEND_INTRO if cfg.send_enabled else _READ_INTRO
+    if cfg.send_any_recipient:
+        intro += _SEND_ANY
     if cfg.send_files_enabled:
         intro += _SEND_FILES
     forbidden = "edit or delete" if cfg.send_enabled else "send, edit, or delete"
