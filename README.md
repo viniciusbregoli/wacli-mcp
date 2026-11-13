@@ -349,10 +349,13 @@ claude mcp add whatsapp --scope user \
 to the checks that apply to text:
 
 - **An outbox.** `file` is a path relative to `WACLI_MCP_SEND_FILE_DIR`, and nothing outside that directory can be
-  sent. Absolute paths, `..`, hidden names (starting with `.`) and control or invisible characters are refused before
-  the filesystem is touched, and each directory level is opened without following symlinks. The file must be a
-  regular, non-empty file within `WACLI_MCP_SEND_FILE_MAX_BYTES`. Whoever can write to the outbox chooses what can
-  be sent, so keep it dedicated to this and do not point it at a home directory.
+  sent. Absolute paths, `..`, hidden names (starting with `.`), control or invisible characters and look-alike
+  blanks (line separators, no-break spaces, Hangul fillers, braille blank) are refused before the filesystem is
+  touched, and each directory level is opened without following symlinks. The file must be a regular, non-empty
+  file within `WACLI_MCP_SEND_FILE_MAX_BYTES`, with a single hard link and owned by the server's user or root (so
+  a hard link to a file from elsewhere is refused). Whoever can write to the outbox chooses what can be sent, so
+  keep it dedicated to this and do not point it at a home directory. The outbox and staging directories must also
+  stay apart from every store, media and download directory and the audit log, or startup fails.
 - **A staging directory.** The server reads the file once, shows you its checksum, and writes exactly those bytes to
   a random name in `WACLI_MCP_SEND_STAGING_DIR`. wacli is then pointed at that copy, not at the outbox, so the file
   cannot change between the approval and the send. The copy is removed after every attempt, whatever the outcome;
@@ -370,7 +373,8 @@ accepted for audio.
 With the default `WACLI_MCP_SEND_CONFIRMATION=elicit`, the client shows you the recipient, the file name, its type,
 its size in bytes, its full SHA-256 and the caption. You do not see the content itself, so approve only a file you
 asked for. If the file changes after the prompt was built, the server asks again with the new checksum, or refuses
-with "the file changed after it was shown for confirmation" and sends nothing.
+with "the file changed after it was shown for confirmation" and sends nothing. Each approval is tied to the one
+call it was shown for, so another call with the same arguments cannot reuse it.
 
 Files share the hourly limit (`WACLI_MCP_SEND_PER_HOUR`) and the duplicate guard with `send_message`. The duplicate
 guard keys on the recipient, the file's checksum and the caption, so a renamed copy of a file that was just sent is
@@ -421,8 +425,12 @@ wacli's read commands work while `sync --follow` holds the store lock.
   with an optional caption; it does not send voice notes, stickers, replies or link previews.
 - A file is held in memory while it is checked and sent, so `WACLI_MCP_SEND_FILE_MAX_BYTES` bounds the memory
   one call needs (at most 100 MiB).
-- The type check looks at the first bytes and, for text, the whole file. An Office document is recognised as a zip
-  archive plus its extension; its inner structure is not inspected.
+- The type check looks at the first bytes and, for text, the whole file. An Office document must be a zip archive
+  with `[Content_Types].xml` and at least one member under `word/`, `xl/` or `ppt/` (matching its extension) and at
+  most 10000 entries; only the zip directory is read, nothing is extracted. Its content is not otherwise inspected.
+- The server checks the outbox and staging directories themselves at startup, not their parents. A parent that
+  another local user can write to lets them swap either directory afterwards, so the parents must be trusted too.
+- Error text from wacli is cleaned of the staging path, the staged name and the file name before the model sees it.
 - If wacli times out, or says the file may still have gone through, `send_file` reports that the outcome is unknown,
   tells the model not to retry and blocks the same file and caption for 10 minutes, as for text.
 - Delivery is not confirmed. A successful `send_message` means WhatsApp accepted the message, not that the
