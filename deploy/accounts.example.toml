@@ -11,6 +11,9 @@ denied_chats = ["15550000002@s.whatsapp.net"]
 # Optional: who this account may message. Ignored unless WACLI_MCP_ENABLE_SEND=1.
 [accounts.personal.send]
 recipients = { me = "15550000001@s.whatsapp.net" }
+# Optional: also any other number, each send approved in a prompt. Ignored unless
+# WACLI_MCP_SEND_ANY_RECIPIENT=1 (see README, Sending to unlisted recipients).
+# any_recipient = true
 
 # A named wacli account (`wacli accounts add work`), resolved once at startup
 # with `wacli accounts show work` and pinned to that store.

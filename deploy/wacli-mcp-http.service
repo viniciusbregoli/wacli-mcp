@@ -26,6 +26,10 @@ Environment=WACLI_MCP_AUDIT_LOG=/home/CHANGE_ME_USER/.local/state/wacli-mcp/audi
 #Environment=WACLI_MCP_STORE=/home/CHANGE_ME_USER/.local/state/wacli
 #Environment=WACLI_MCP_ENABLE_SEND=1
 #Environment=WACLI_MCP_SEND_RECIPIENTS=me=CHANGE_ME_JID
+# Optional: other numbers, each send approved in a prompt by a client you
+# verified (see README, Sending to unlisted recipients).
+#Environment=WACLI_MCP_SEND_ANY_RECIPIENT=1
+#Environment=WACLI_MCP_SEND_CONFIRM_CLIENTS=codex-mcp-client
 # Several accounts instead (see README, Multiple accounts): replaces
 # WACLI_MCP_STORE and WACLI_MCP_SEND_RECIPIENTS above. Add every store to
 # ReadWritePaths below.
