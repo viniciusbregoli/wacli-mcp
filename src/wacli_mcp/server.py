@@ -467,7 +467,7 @@ def build_server(cfg: Config, runner: WacliRunner | None = None) -> MCPServer:
             view = select(cfg, account)
             msg_id = validation.message_id(message_id)
             group = validation.media_group(chat, view)
-            stem = media.saved_stem(group, msg_id)
+            stem = media.saved_stem(group, msg_id, view.alias if cfg.multi_account else None)
             started = time.monotonic()
             record: dict[str, Any] = {"tool": "download_group_media"}
             if cfg.multi_account:

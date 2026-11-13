@@ -46,6 +46,7 @@ PER_ACCOUNT_ENV = (
     "WACLI_MCP_ALLOWED_CHATS",
     "WACLI_MCP_DENIED_CHATS",
     "WACLI_MCP_SEND_RECIPIENTS",
+    "WACLI_MCP_MEDIA_DIR",
 )
 SendConfirmation = Literal["elicit", "none"]
 
@@ -180,6 +181,20 @@ def _media_dir(path: Path, what: str) -> Path:
     # Another local user who can write here could plant files for the server to hand out.
     _check_not_writable_by_others(resolved, what)
     return resolved
+
+
+def _auto_media_dir(store_dir: Path | None) -> Path | None:
+    """The store's own media directory, if it has one that passes the checks.
+
+    Auto-detected, so a bad directory only disables media; it must not stop the text tools.
+    """
+    if store_dir is None or not (store_dir / "media").is_dir():
+        return None
+    try:
+        return _media_dir(store_dir / "media", "store media directory")
+    except (ConfigError, OSError, RuntimeError) as exc:
+        logging.getLogger("wacli_mcp").warning("media access disabled: %s", exc)
+        return None
 
 
 def probe_network_isolation(unshare: Path) -> bool:
@@ -321,15 +336,7 @@ class Config:
             raise ConfigError("a JID cannot be both allowed and denied")
 
         media_raw = env.get("WACLI_MCP_MEDIA_DIR", "").strip()
-        media_dir = None
-        if media_raw:
-            media_dir = _media_dir(Path(media_raw), "WACLI_MCP_MEDIA_DIR")
-        elif store_dir is not None and (store_dir / "media").is_dir():
-            # Auto-detected, so a bad directory only disables media; it must not stop the text tools.
-            try:
-                media_dir = _media_dir(store_dir / "media", "store media directory")
-            except (ConfigError, OSError, RuntimeError) as exc:
-                logging.getLogger("wacli_mcp").warning("media access disabled: %s", exc)
+        media_dir = _media_dir(Path(media_raw), "WACLI_MCP_MEDIA_DIR") if media_raw else _auto_media_dir(store_dir)
 
         allow_raw = env.get("WACLI_MCP_ALLOW_MEDIA_DOWNLOAD", "").strip().lower()
         if allow_raw not in ("", "0", "1", "false", "true"):
@@ -582,6 +589,8 @@ def load_accounts_file(
                 label=label,
                 store_dir=store_dir,
                 account=None,
+                # Each account serves only the media of its own store.
+                media_dir=_auto_media_dir(store_dir),
                 allowed_chats=allowed,
                 denied_chats=denied,
                 # Both switches are needed: the environment enables sending, the file says to whom.

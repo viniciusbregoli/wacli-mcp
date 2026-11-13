@@ -164,10 +164,14 @@ def valid_direct_path(value: object) -> bool:
     return isinstance(value, str) and bool(DIRECT_PATH_RE.fullmatch(value)) and not _DIRECT_PATH_TRICKS.search(value)
 
 
-def saved_stem(group: str, msg_id: str) -> str:
+def saved_stem(group: str, msg_id: str, account: str | None = None) -> str:
     """Server-chosen file name. Group JIDs and message IDs may both contain '-' but never '.',
-    so '.' keeps every (group, message) pair on its own name."""
-    return f"{group.split('@', 1)[0]}.{msg_id}"
+    so '.' keeps every (group, message) pair on its own name.
+
+    With several accounts the alias (which never contains '.') comes first, so one account
+    can never be served another account's copy of the same message."""
+    stem = f"{group.split('@', 1)[0]}.{msg_id}"
+    return stem if account is None else f"{account}.{stem}"
 
 
 def _open_dir(directory: Path) -> int:
