@@ -20,6 +20,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import secrets
 import time
 import unicodedata
@@ -182,6 +183,29 @@ def _unstage(path: Path) -> None:
     except OSError:
         # Raising here would turn a delivered file into a tool error. The path is not logged: it is a secret name.
         logging.getLogger("wacli_mcp").warning("a staged file could not be removed from the staging directory")
+
+
+_STAGED_NAME = re.compile(r"[0-9a-f]{32}\.[a-z0-9]{1,5}")
+
+
+def remove_stale_snapshots(directory: Path, max_age_s: float) -> None:
+    """Delete snapshots left behind by calls cancelled while staging. Only names this server creates, and
+    only old ones: another server process sharing the directory may be sending one right now."""
+    cutoff = time.time() - max_age_s
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if (
+                _STAGED_NAME.fullmatch(entry.name)
+                and entry.is_file(follow_symlinks=False)
+                and entry.stat(follow_symlinks=False).st_mtime < cutoff
+            ):
+                os.unlink(entry.path)
+        except OSError:
+            continue
 
 
 def _size_text(size: int) -> str:
@@ -361,6 +385,7 @@ def register_send_tool(
     def register_file_tool() -> None:
         assert cfg.send_file_dir is not None and cfg.send_staging_dir is not None
         outbox_dir, staging_dir, max_bytes = cfg.send_file_dir, cfg.send_staging_dir, cfg.send_file_max_bytes
+        remove_stale_snapshots(staging_dir, max_age_s=max(600.0, 4 * cfg.send_timeout_s))
         # Digest of the file shown to the user for each argument set, so the send can prove it is the same file.
         shown: OrderedDict[str, str] = OrderedDict()
         file_confirm_note = (

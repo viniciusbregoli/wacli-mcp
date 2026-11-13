@@ -355,8 +355,9 @@ to the checks that apply to text:
   be sent, so keep it dedicated to this and do not point it at a home directory.
 - **A staging directory.** The server reads the file once, shows you its checksum, and writes exactly those bytes to
   a random name in `WACLI_MCP_SEND_STAGING_DIR`. wacli is then pointed at that copy, not at the outbox, so the file
-  cannot change between the approval and the send. The copy is removed after every attempt, whatever the outcome.
-  The server also sets `WACLI_MEDIA_ROOTS` to the staging directory for that one wacli call, so wacli's own check
+  cannot change between the approval and the send. The copy is removed after every attempt, whatever the outcome;
+  a copy left by a call cancelled mid-write is removed at the next startup once it is older than ten minutes (or
+  four send timeouts, if longer). The server also sets `WACLI_MEDIA_ROOTS` to the staging directory for that one wacli call, so wacli's own check
   refuses any `--file` outside it.
 
 Allowed types are decided by the file's content, and the extension must agree with it (case does not matter):

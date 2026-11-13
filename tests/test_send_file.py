@@ -838,3 +838,19 @@ async def test_multi_account_send_needs_the_daemon_of_that_account(fake, dirs, m
     entries = [json.loads(line) for line in log.read_text().splitlines()]
     assert [(e["account"], e["outcome"]) for e in entries] == [("work", "rejected"), ("personal", "sent")]
     assert "a.png" not in log.read_text()
+
+
+def test_stale_snapshots_are_removed_at_startup_and_fresh_ones_are_kept(fake, dirs):
+    # A call cancelled while its snapshot was being written can leave the file behind.
+    _, staging = dirs
+    stale = staging / ("ab" * 16 + ".pdf")
+    fresh = staging / ("cd" * 16 + ".pdf")
+    unrelated = staging / "notes.txt"
+    for path in (stale, fresh, unrelated):
+        path.write_bytes(PDF)
+    old = stale.stat().st_mtime - 3600
+    os.utime(stale, (old, old))
+    os.utime(unrelated, (old, old))
+    build_server(file_config(fake, dirs))
+    assert not stale.exists()
+    assert fresh.exists() and unrelated.exists()
