@@ -203,6 +203,34 @@ def _staging_dir(path: Path, outbox: Path, what: str) -> Path:
     return resolved
 
 
+def _overlaps(a: Path, b: Path) -> bool:
+    return a == b or a in b.parents or b in a.parents
+
+
+def _check_send_dirs_apart(cfg: Config) -> None:
+    """The outbox and staging directory must not share space with data the server reads or writes elsewhere."""
+    assert cfg.send_file_dir is not None and cfg.send_staging_dir is not None
+    protected: list[tuple[str, Path]] = []
+    for view in cfg.account_views():
+        for what, path in (("a store directory", view.store_dir), ("a media directory", view.media_dir)):
+            if path is not None:
+                protected.append((what, path.resolve()))
+    for what, path in (("a media directory", cfg.media_dir), ("the download directory", cfg.download_dir)):
+        if path is not None:
+            protected.append((what, path.resolve()))
+    for name, directory in (
+        ("WACLI_MCP_SEND_FILE_DIR", cfg.send_file_dir),
+        ("WACLI_MCP_SEND_STAGING_DIR", cfg.send_staging_dir),
+    ):
+        for what, path in protected:
+            if _overlaps(directory, path):
+                raise ConfigError(f"{name} must not equal, contain, or be inside {what}")
+        if cfg.audit_log is not None:
+            log = cfg.audit_log.parent.resolve() / cfg.audit_log.name
+            if directory in log.parents:
+                raise ConfigError(f"{name} must not contain the audit log")
+
+
 def _auto_media_dir(store_dir: Path | None) -> Path | None:
     """The store's own media directory, if it has one that passes the checks.
 
@@ -481,16 +509,21 @@ class Config:
             send_file_max_bytes=_int(env, "WACLI_MCP_SEND_FILE_MAX_BYTES", 16 * 1024 * 1024, 1024, 100 * 1024 * 1024),
         )
         if not accounts_file:
+            if send_files:
+                _check_send_dirs_apart(base)
             return base
         views = load_accounts_file(Path(accounts_file), base, send_switch=send_enabled, env=env)
         # The top level keeps no store or policy of its own: every call goes through a view.
-        return replace(
+        cfg = replace(
             base,
             alias="",
             send_enabled=any(v.send_enabled for v in views),
             send_files_enabled=base.send_files_enabled and any(v.send_enabled for v in views),
             accounts=views,
         )
+        if send_files:
+            _check_send_dirs_apart(cfg)
+        return cfg
 
 
 _ACCOUNT_KEYS = frozenset({"store", "wacli_account", "label", "allowed_chats", "denied_chats", "send"})
