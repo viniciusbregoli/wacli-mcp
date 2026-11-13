@@ -447,7 +447,10 @@ wacli's read commands work while `sync --follow` holds the store lock.
 - The declared size is the sender's claim. If it understates the file, wacli 0.25.1 still transfers it and buffers
   the encrypted bytes in memory, up to its own fixed 100 MiB HTTP limit, before writing anything. `RLIMIT_FSIZE`
   only caps what is written to disk (about 1 MiB over the limit), so an understated size can cost up to about
-  100 MiB of transfer and memory in the wacli child before the call fails.
+  100 MiB of transfer before the call fails. Peak memory in the wacli child is higher than that, because wacli also
+  copies the ciphertext to decrypt it; plan for a few hundred MiB per download. `WACLI_MCP_MAX_MEDIA_BYTES` does not
+  bound the transfer or the child's memory, only what is kept and served. Bounding the receive side needs a change in
+  wacli itself.
 - The media, download, outbox and staging directories are checked together with all their parents: each parent must
   be owned by you or root, and must not be writable by others unless it is sticky (such as `/tmp`). A parent may be
   group-writable only when that group is your own private group, which no other account belongs to (as with
