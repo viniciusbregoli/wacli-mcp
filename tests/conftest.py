@@ -22,10 +22,20 @@ REAL_WACLI = Path(os.environ.get("WACLI_MCP_TEST_BIN", str(Path.home() / ".local
 FAKE_WACLI = textwrap.dedent(
     """\
     #!{python} -I
-    import json, os, socket, sys, time
+    import hashlib, json, os, socket, sys, time
     home = os.environ.get("HOME", "")
+    # For `send file`, what the --file path holds at the moment wacli runs.
+    staged = {{}}
+    for arg in sys.argv[1:]:
+        if arg.startswith("--file="):
+            try:
+                with open(arg[7:], "rb") as src:
+                    digest = hashlib.sha256(src.read()).hexdigest()
+                staged = {{"sha256": digest, "mode": os.stat(arg[7:]).st_mode & 0o777}}
+            except OSError as exc:
+                staged = {{"error": str(exc)}}
     with open(os.path.join(home, "calls.jsonl"), "a") as fh:
-        fh.write(json.dumps({{"argv": sys.argv[1:], "env": dict(os.environ)}}) + "\\n")
+        fh.write(json.dumps({{"argv": sys.argv[1:], "env": dict(os.environ), "staged": staged}}) + "\\n")
     try:
         with open(os.path.join(home, "scenario.json")) as fh:
             sc = json.load(fh)
