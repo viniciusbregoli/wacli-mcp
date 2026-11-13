@@ -13,8 +13,10 @@ and open), and the bytes themselves must look like a photo or video.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
+import secrets
 import shutil
 import stat
 import time
@@ -212,7 +214,8 @@ def read_single_file(directory: Path, max_bytes: int) -> bytes:
 def save_new_file(directory: Path, name: str, data: bytes) -> None:
     """Write data as directory/name (mode 0600) without ever replacing or following an existing entry."""
     dir_fd = _open_dir(directory)
-    part = f".{name}.part"
+    # Unique per attempt, so a leftover from a killed process can never block a later save.
+    part = f".{name}.{secrets.token_hex(8)}.part"
     try:
         try:
             fd = os.open(
@@ -237,6 +240,31 @@ def save_new_file(directory: Path, name: str, data: bytes) -> None:
                 os.unlink(part, dir_fd=dir_fd)
             except FileNotFoundError:
                 pass
+    finally:
+        os.close(dir_fd)
+
+
+def save_within_capacity(directory: Path, name: str, data: bytes, max_total_bytes: int) -> None:
+    """save_new_file, but refused when the directory would end up over max_total_bytes.
+
+    The check and the write happen under an exclusive lock, so several server processes sharing the
+    directory cannot each pass the check and together go over the limit.
+    """
+    dir_fd = _open_dir(directory)
+    try:
+        try:
+            lock_fd = os.open(
+                ".capacity.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd
+            )
+        except OSError as exc:
+            raise MediaError("the download directory cannot be locked") from exc
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if directory_usage(directory) + len(data) > max_total_bytes:
+                raise MediaError("the download directory is full (WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES)")
+            save_new_file(directory, name, data)
+        finally:
+            os.close(lock_fd)  # also drops the lock
     finally:
         os.close(dir_fd)
 

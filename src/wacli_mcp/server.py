@@ -535,7 +535,9 @@ def build_server(cfg: Config, runner: WacliRunner | None = None) -> MCPServer:
                     if downloaded:
                         name = stem + media.EXTENSIONS[mime]
                         try:
-                            await asyncio.to_thread(media.save_new_file, download_dir, name, data)
+                            await asyncio.to_thread(
+                                media.save_within_capacity, download_dir, name, data, cfg.max_download_dir_bytes
+                            )
                         except media.AlreadySaved:
                             # Another server process saved this message meanwhile: serve its copy.
                             saved = await asyncio.to_thread(media.find_saved, download_dir, stem, cfg.max_media_bytes)
