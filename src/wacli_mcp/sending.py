@@ -394,6 +394,11 @@ def register_send_tool(
         params = session.client_params
         name = params.client_info.name if params is not None and params.client_info is not None else None
         if name not in cfg.send_confirm_clients:
+            # Goes to stderr for the operator, who needs the exact name to list a client after checking it.
+            logging.getLogger("wacli_mcp").warning(
+                "refused a send to an unlisted recipient: MCP client name %r is not in WACLI_MCP_SEND_CONFIRM_CLIENTS",
+                name[:64] if isinstance(name, str) else name,
+            )
             raise ToolError(refusal.format("this MCP client is not one the operator verified to show approvals"))
 
     def check_prompt(question: str) -> None:
