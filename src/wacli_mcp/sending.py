@@ -39,7 +39,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context, Elicit, Resolve
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import outbox
 from .accounts import account_param
@@ -69,7 +69,16 @@ _PHONE_RE = re.compile(r"\+?[0-9][0-9 ().-]{6,24}")
 _ZWJ = chr(0x200D)  # zero-width joiner, needed by emoji sequences
 
 
+def _spec_form_schema(schema: dict[str, Any], _model: type) -> None:
+    # The MCP form requestedSchema allows only $schema, type, properties and required at the top. Pydantic adds the
+    # model name as "title", and Codex (as run by OpenBot) refuses such a form and answers cancel before any person
+    # sees it, so no send could ever be approved there.
+    schema.pop("title", None)
+
+
 class SendApproval(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_spec_form_schema)
+
     approve: bool = Field(description="Send exactly this message to this recipient now?")
 
 
