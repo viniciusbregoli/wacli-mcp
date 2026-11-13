@@ -36,7 +36,11 @@ def _check(cfg: Config) -> int:
         return 1
     reports = []
     for view, data in results:
-        report = {"store": _store_label(view), **shape_doctor(data, view)}
+        report = {
+            "store": _store_label(view),
+            "media_dir": str(view.media_dir) if view.media_dir else None,
+            **shape_doctor(data, view),
+        }
         if cfg.multi_account:
             report = {"account": view.alias, **({"label": view.label} if view.label else {}), **report}
         reports.append(report)

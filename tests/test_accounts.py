@@ -16,7 +16,15 @@ from wacli_mcp.server import build_server
 
 pytestmark = pytest.mark.anyio
 
-READ_TOOLS = {"list_chats", "list_messages", "search_messages", "search_contacts", "history_coverage", "archive_health"}
+READ_TOOLS = {
+    "list_chats",
+    "list_messages",
+    "search_messages",
+    "search_contacts",
+    "history_coverage",
+    "archive_health",
+    "get_group_media",
+}
 SENT = {"sent": True, "to": ADA, "id": "3EB0FAKEMESSAGEID"}
 
 

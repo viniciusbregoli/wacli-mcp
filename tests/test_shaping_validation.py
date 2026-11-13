@@ -52,6 +52,8 @@ def test_message_projection_drops_local_and_cdn_paths():
         "timestamp": "2026-01-01T00:00:00Z",
         "from_me": False,
         "text": "hello",
+        # Additive: says a local copy exists without revealing where.
+        "media_available_locally": True,
     }
 
 

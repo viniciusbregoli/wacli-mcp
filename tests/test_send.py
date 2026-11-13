@@ -305,3 +305,18 @@ def test_send_is_off_unless_enabled(fake):
 def test_send_config_errors(fake, extra, message):
     with pytest.raises(ConfigError, match=message):
         Config.from_env(env_for(fake, **extra))
+
+
+@pytest.mark.parametrize(
+    "scenario", [{"stdout": "not json at all"}, {"stdout": "", "rc": 1}, {"stdout": "boom", "rc": 2}]
+)
+async def test_a_reply_without_an_envelope_is_an_uncertain_outcome(fake, daemon, scenario):
+    # wacli may have handed the message over before it died or printed something unparseable.
+    fake.scenario(**scenario)
+    server = build_server(send_config(fake))
+    async with Client(server, elicitation_callback=User()) as client:
+        first = await client.call_tool("send_message", {"recipient": "ada", "text": "once"})
+        retry = await client.call_tool("send_message", {"recipient": "ada", "text": "once"})
+    assert first.is_error and "outcome is unknown" in first.content[0].text
+    assert retry.is_error and "already sent" in retry.content[0].text
+    assert len(fake.calls()) == 1

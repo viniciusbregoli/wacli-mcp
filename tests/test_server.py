@@ -17,6 +17,7 @@ EXPECTED_TOOLS = {
     "search_contacts",
     "history_coverage",
     "archive_health",
+    "get_group_media",
 }
 SEARCH_RESULT = {
     "messages": [

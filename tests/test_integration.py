@@ -8,6 +8,7 @@ so nothing can reach WhatsApp.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 import pytest
@@ -184,6 +185,91 @@ async def test_send_is_delegated_to_the_sync_daemon_from_an_offline_sandbox(tmp_
     assert not request.get("allow_self") and not request.get("mentions") and not request.get("reply_to")
     # The delegated path never opens the archive for writing.
     assert (db.stat().st_mtime_ns, db.stat().st_size) == before
+
+
+async def test_send_file_is_delegated_with_a_staged_snapshot_from_an_offline_sandbox(tmp_path_factory):
+    """Real wacli hands a staged copy of an outbox file to the fake daemon and never opens the archive."""
+    from conftest import DAEMON_REPLY, FakeDaemon
+    from mcp.types import ElicitResult
+
+    root = tmp_path_factory.mktemp("f")
+    home, store_dir = build_real_store(root)
+    outbox, staging = root / "outbox", root / "staging"
+    for path in (outbox, staging):
+        path.mkdir(mode=0o700)
+    pdf = b"%PDF-1.4\nsynthetic invoice\n"
+    (outbox / "invoice.pdf").write_bytes(pdf)
+    db = store_dir / "wacli.db"
+    before = (db.stat().st_mtime_ns, db.stat().st_size)
+    prompts = []
+
+    async def user(context, params):
+        prompts.append(params.message)
+        return ElicitResult(action="accept", content={"approve": True})
+
+    daemon = FakeDaemon(store_dir)
+    try:
+        cfg = make_config(
+            (home, store_dir),
+            WACLI_MCP_ENABLE_SEND="1",
+            WACLI_MCP_SEND_RECIPIENTS=f"ada={ADA}",
+            WACLI_MCP_ENABLE_SEND_FILES="1",
+            WACLI_MCP_SEND_FILE_DIR=str(outbox),
+            WACLI_MCP_SEND_STAGING_DIR=str(staging),
+        )
+        assert cfg.network_isolated
+        async with Client(build_server(cfg), elicitation_callback=user) as client:
+            result = await client.call_tool(
+                "send_file", {"recipient": "ada", "file": "invoice.pdf", "caption": "the invoice"}
+            )
+        requests = daemon.requests()
+    finally:
+        daemon.stop()
+
+    assert not result.is_error, result.content
+    assert result.structured_content["sent"] is True
+    assert result.structured_content["message_id"] == DAEMON_REPLY["id"]
+    assert len(prompts) == 1 and "invoice.pdf" in prompts[0]
+    (request,) = requests
+    assert request["kind"] == "file"
+    assert request["to"] == ADA
+    assert os.path.dirname(request["file"]) == str(staging.resolve())
+    assert request["file"].endswith(".pdf") and os.path.basename(request["file"]) != "invoice.pdf"
+    assert request["filename"] == "invoice.pdf"
+    assert request["mime"] == "application/pdf"
+    assert request["as"] == "document"
+    assert request["caption"] == "the invoice"
+    assert request["max_size_bytes"] == 16 * 1024 * 1024
+    assert not request.get("reply_to") and not request.get("ptt")
+    assert list(staging.iterdir()) == []
+    assert (outbox / "invoice.pdf").read_bytes() == pdf
+    assert (db.stat().st_mtime_ns, db.stat().st_size) == before
+
+
+async def test_wacli_refuses_a_file_outside_the_media_roots_it_is_given(tmp_path_factory):
+    """WACLI_MEDIA_ROOTS makes the real wacli child refuse any --file outside the staging directory."""
+    from conftest import FakeDaemon
+
+    from wacli_mcp.runner import WacliError, WacliRunner
+
+    root = tmp_path_factory.mktemp("r")
+    home, store_dir = build_real_store(root)
+    staging = root / "staging"
+    staging.mkdir(mode=0o700)
+    elsewhere = root / "elsewhere.txt"
+    elsewhere.write_text("not staged")
+    daemon = FakeDaemon(store_dir)
+    try:
+        cfg = make_config((home, store_dir), WACLI_MCP_ENABLE_SEND="1", WACLI_MCP_SEND_RECIPIENTS=f"ada={ADA}")
+        with pytest.raises(WacliError):
+            await WacliRunner(cfg).run_write(
+                ["send", "file", f"--to={ADA}", f"--file={elsewhere}", "--mime=text/plain", "--as=document"],
+                extra_env={"WACLI_MEDIA_ROOTS": str(staging.resolve())},
+            )
+        requests = daemon.requests()
+    finally:
+        daemon.stop()
+    assert requests == []
 
 
 async def test_send_without_daemon_never_runs_wacli(tmp_path_factory):

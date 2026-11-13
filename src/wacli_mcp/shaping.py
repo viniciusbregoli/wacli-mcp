@@ -74,6 +74,9 @@ def project_message(raw: dict[str, Any], max_chars: int) -> dict[str, Any]:
     record = {new: raw.get(old) for old, new in _MESSAGE_FIELDS.items() if old in raw}
     if not record.get("text"):
         record["text"] = raw.get("DisplayText") or ""
+    # Only whether a local copy exists; the path itself stays private.
+    if raw.get("LocalPath"):
+        record["media_available_locally"] = True
     return _clean(_drop_empty(record), max_chars)
 
 
@@ -181,12 +184,17 @@ def shape_doctor(data: Any, cfg) -> dict[str, Any]:
             "chat_allowlist_active": bool(cfg.allowed_chats),
             "denied_chat_count": len(cfg.denied_chats),
             "rate_limit_per_minute": cfg.rate_limit_per_minute,
+            "media_access_configured": cfg.media_dir is not None,
+            "max_media_bytes": cfg.max_media_bytes,
+            "media_download_enabled": cfg.allow_media_download,
             "send_enabled": cfg.send_enabled,
             **(
                 {
                     "send_recipients": [alias for alias, _ in cfg.send_recipients],
                     "send_confirmation": cfg.send_confirmation,
                     "send_per_hour": cfg.send_per_hour,
+                    "send_files_enabled": cfg.send_files_enabled,
+                    **({"send_file_max_bytes": cfg.send_file_max_bytes} if cfg.send_files_enabled else {}),
                 }
                 if cfg.send_enabled
                 else {}

@@ -8,7 +8,7 @@ import os
 import signal
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .config import Config
@@ -20,6 +20,8 @@ MAX_ERROR_CHARS = 300
 # Environment variables passed to wacli. Everything else (API keys, tokens,
 # WACLI_STORE_DIR overrides) is dropped so the child sees only what it needs.
 PASSTHROUGH_ENV = ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "TZ")
+# Extra variables a write call may set. WACLI_MEDIA_ROOTS confines `send file --file` to a directory.
+WRITE_EXTRA_ENV = frozenset({"WACLI_MEDIA_ROOTS"})
 
 
 class WacliError(Exception):
@@ -64,11 +66,32 @@ class WacliRunner:
         # One send at a time, so confirmations and outcomes map one to one.
         self._write_lock = asyncio.Lock()
 
-    def build_argv(self, args: Sequence[str], *, write: bool = False, target: Config | None = None) -> list[str]:
+    def build_argv(
+        self,
+        args: Sequence[str],
+        *,
+        write: bool = False,
+        network: bool = False,
+        max_file_bytes: int | None = None,
+        target: Config | None = None,
+    ) -> list[str]:
         """Build the argv for one call. `target` is the account view to run against (default: the server's)."""
         cfg = self.cfg
         selector = target or cfg
-        argv = [*cfg.sandbox_prefix, str(cfg.wacli_bin)]
+        # Media download is the only command allowed out of the empty network
+        # namespace: in --read-only mode wacli fetches the encrypted file from the
+        # WhatsApp CDN without opening a session.
+        if network and (write or tuple(args[:2]) != ("media", "download")):
+            raise WacliError("network access is only allowed for media download", kind="policy")
+        if network and max_file_bytes is None:
+            raise WacliError("a network download needs a file size limit", kind="policy")
+        if network:
+            # prlimit sets RLIMIT_FSIZE in the child only. Setting it from Python
+            # (preexec_fn) is unsafe in a threaded server and would also bind this process.
+            prefix: tuple[str, ...] = (str(cfg.prlimit_bin), f"--fsize={max_file_bytes}:{max_file_bytes}", "--")
+        else:
+            prefix = cfg.sandbox_prefix
+        argv = [*prefix, str(cfg.wacli_bin)]
         if write:
             argv += ["--json", f"--timeout={int(cfg.send_timeout_s)}s"]
         else:
@@ -83,7 +106,7 @@ class WacliRunner:
         argv.extend(args)
         return argv
 
-    def build_env(self, *, write: bool = False) -> dict[str, str]:
+    def build_env(self, *, write: bool = False, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         env = {
             "HOME": str(self.cfg.home),
             "PATH": "/usr/bin:/bin",
@@ -95,24 +118,43 @@ class WacliRunner:
         for key in PASSTHROUGH_ENV:
             if key in os.environ:
                 env[key] = os.environ[key]
+        if extra:
+            if not write or not set(extra) <= WRITE_EXTRA_ENV:
+                raise WacliError("this environment variable cannot be set for this call", kind="policy")
+            env.update(extra)
         return env
 
-    async def run(self, args: Sequence[str], target: Config | None = None) -> Any:
-        """Run one wacli read command and return the `data` field of its JSON envelope."""
+    async def run(
+        self,
+        args: Sequence[str],
+        *,
+        network: bool = False,
+        max_file_bytes: int | None = None,
+        target: Config | None = None,
+    ) -> Any:
+        """Run one wacli read command and return the `data` field of its JSON envelope.
+
+        max_file_bytes sets RLIMIT_FSIZE on the child (through prlimit), so a download
+        larger than the limit is stopped while it is written instead of filling the disk.
+        """
+        argv = self.build_argv(args, network=network, max_file_bytes=max_file_bytes, target=target)
         self._limiter.check()
-        argv = self.build_argv(args, target=target)
         async with self._sem:
             stdout, stderr, returncode = await self._spawn(argv, self.build_env(), self.cfg.timeout_s)
         return self._parse(stdout, stderr, returncode)
 
-    async def run_write(self, args: Sequence[str], target: Config | None = None) -> Any:
+    async def run_write(
+        self, args: Sequence[str], target: Config | None = None, *, extra_env: Mapping[str, str] | None = None
+    ) -> Any:
         """Run one wacli write command. Callers own authorization, confirmation and rate limits.
 
         Never retried: a send that timed out may still have been delivered.
         """
         async with self._write_lock:
             stdout, stderr, returncode = await self._spawn(
-                self.build_argv(args, write=True, target=target), self.build_env(write=True), self.cfg.send_timeout_s
+                self.build_argv(args, write=True, target=target),
+                self.build_env(write=True, extra=extra_env),
+                self.cfg.send_timeout_s,
             )
         return self._parse(stdout, stderr, returncode)
 
@@ -174,7 +216,9 @@ class WacliRunner:
             message = "wacli returned output that is not a JSON envelope"
         else:
             message = f"wacli exited with status {returncode}"
-        raise WacliError(sanitize_text(message, MAX_ERROR_CHARS))
+        # Without an error from wacli itself the outcome is unknown: it may have died after doing the work.
+        kind = "wacli_error" if envelope is not None and envelope.get("error") else "protocol"
+        raise WacliError(sanitize_text(message, MAX_ERROR_CHARS), kind=kind)
 
 
 async def _read_capped(stream: asyncio.StreamReader, cap: int, on_overflow: Callable[[], None] | None = None) -> bytes:

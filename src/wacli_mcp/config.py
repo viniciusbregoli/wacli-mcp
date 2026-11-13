@@ -10,13 +10,18 @@ here.
 
 from __future__ import annotations
 
+import errno
+import grp
 import hashlib
 import ipaddress
 import json
+import logging
 import os
+import pwd
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tomllib
 from collections.abc import Callable, Mapping
@@ -28,6 +33,8 @@ NetworkIsolation = Literal["require", "auto", "off"]
 
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 JID_RE = re.compile(r"^[0-9A-Za-z._:+-]{1,64}@(s\.whatsapp\.net|g\.us|lid|newsletter|broadcast|c\.us)$")
+# Group JIDs only: current groups are all digits, legacy ones are <creator>-<timestamp>.
+GROUP_JID_RE = re.compile(r"(?:[0-9]{5,32}|[0-9]{5,20}-[0-9]{5,20})@g\.us")
 # Sending is limited to people and groups. Channels, status and broadcast lists are excluded.
 SEND_JID_RE = re.compile(r"^[0-9]{5,20}(-[0-9]{5,20})?@(s\.whatsapp\.net|g\.us|lid)$")
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -43,6 +50,7 @@ PER_ACCOUNT_ENV = (
     "WACLI_MCP_ALLOWED_CHATS",
     "WACLI_MCP_DENIED_CHATS",
     "WACLI_MCP_SEND_RECIPIENTS",
+    "WACLI_MCP_MEDIA_DIR",
 )
 SendConfirmation = Literal["elicit", "none"]
 
@@ -167,6 +175,176 @@ def validate_executable(path: Path, *, sha256: str | None = None) -> Path:
     return resolved
 
 
+def _group_is_private(gid: int) -> bool:
+    """True when `gid` is the current user's primary group and nobody else belongs to it."""
+    me = pwd.getpwuid(os.getuid())
+    if gid != me.pw_gid:
+        return False
+    try:
+        members = grp.getgrgid(gid).gr_mem
+    except KeyError:
+        members = []
+    if any(member != me.pw_name for member in members):
+        return False
+    return not any(user.pw_gid == gid and user.pw_uid != os.getuid() for user in pwd.getpwall())
+
+
+_ACL_XATTR = "system.posix_acl_access"
+_ACL_VERSION = 2
+_ACL_USER, _ACL_GROUP = 0x02, 0x08
+_ACL_WRITE = 0x02
+
+
+def _acl_grants_others(path: Path, perms: int) -> bool:
+    """True when the directory's POSIX ACL gives a named user other than us, or a named group that is not our
+    private group, any of `perms`. Mode bits do not show these entries. The ACL mask is ignored, which only
+    makes the check stricter. An ACL in a format this code does not know counts as granting access."""
+    try:
+        raw = os.getxattr(path, _ACL_XATTR, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return False
+        raise
+    if len(raw) < 4 or (len(raw) - 4) % 8 or struct.unpack_from("<I", raw)[0] != _ACL_VERSION:
+        return True
+    for tag, perm, ident in struct.iter_unpack("<HHI", raw[4:]):
+        if not perm & perms:
+            continue
+        if tag == _ACL_USER and ident != os.getuid():
+            return True
+        if tag == _ACL_GROUP and not _group_is_private(ident):
+            return True
+    return False
+
+
+def _check_ancestors(path: Path, what: str) -> None:
+    """Every parent of a trusted directory must be trusted too, or its owner could be swapped after startup.
+
+    A parent may be writable by the user's own private group (such as ~/.local, mode 775) and may be
+    world-writable only with the sticky bit (such as /tmp).
+    """
+    try:
+        for parent in path.parents:
+            st = parent.stat()
+            if st.st_uid not in (os.getuid(), 0):
+                raise ConfigError(
+                    f"{what} {path}: parent {parent} is owned by uid {st.st_uid}, expected the current user or root"
+                )
+            if st.st_mode & stat.S_ISVTX:
+                # Sticky and owned by root or us: others can add entries but cannot rename or delete ours.
+                continue
+            if st.st_mode & stat.S_IWOTH:
+                raise ConfigError(f"{what} {path}: parent {parent} is writable by others")
+            if st.st_mode & stat.S_IWGRP and not _group_is_private(st.st_gid):
+                raise ConfigError(f"{what} {path}: parent {parent} is writable by a group that has other members")
+            if _acl_grants_others(parent, _ACL_WRITE):
+                raise ConfigError(f"{what} {path}: parent {parent} has an access control list that lets others write")
+    except OSError as exc:
+        raise ConfigError(f"{what} {path}: a parent directory cannot be checked: {exc.strerror}") from exc
+
+
+def _private_dir(path: Path, what: str) -> Path:
+    """Vet a directory only the current user may use and return its resolved form."""
+    if not path.is_absolute():
+        raise ConfigError(f"{what} must be absolute")
+    if not path.is_dir():
+        raise ConfigError(f"{what} does not exist or is not a directory: {path}")
+    resolved = path.resolve(strict=True)
+    st = resolved.stat()
+    if st.st_uid != os.getuid():
+        raise ConfigError(f"{what} {resolved} must be owned by the current user")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ConfigError(
+            f"{what} {resolved} is writable by group or others and "
+            "must not be accessible by group or others (chmod 700)"
+        )
+    if st.st_mode & 0o077:
+        raise ConfigError(f"{what} {resolved} must not be accessible by group or others (chmod 700)")
+    try:
+        shared = _acl_grants_others(resolved, 0o7)
+    except OSError as exc:
+        raise ConfigError(f"{what} {resolved}: its access control list cannot be read: {exc.strerror}") from exc
+    if shared:
+        raise ConfigError(f"{what} {resolved} has an access control list that gives others access")
+    _check_ancestors(resolved, what)
+    return resolved
+
+
+def _media_dir(path: Path, what: str) -> Path:
+    """Vet the directory media files are served from and return its resolved form."""
+    if not path.is_absolute():
+        raise ConfigError(f"{what} must be absolute")
+    if not path.is_dir():
+        raise ConfigError(f"{what} does not exist or is not a directory: {path}")
+    resolved = path.resolve(strict=True)
+    # Another local user who can write here could plant files for the server to hand out.
+    _check_not_writable_by_others(resolved, what)
+    try:
+        shared = _acl_grants_others(resolved, _ACL_WRITE)
+    except OSError as exc:
+        raise ConfigError(f"{what} {resolved}: its access control list cannot be read: {exc.strerror}") from exc
+    if shared:
+        raise ConfigError(f"{what} {resolved} has an access control list that lets others write")
+    _check_ancestors(resolved, what)
+    return resolved
+
+
+def _staging_dir(path: Path, outbox: Path, what: str) -> Path:
+    """Vet the private directory approved file snapshots are written to and return its resolved form."""
+    resolved = _private_dir(path, what)
+    if resolved == outbox or outbox in resolved.parents or resolved in outbox.parents:
+        raise ConfigError(f"{what} must not be the outbox, inside it, or contain it")
+    if os.pathsep in str(resolved):
+        # The path goes into WACLI_MEDIA_ROOTS, a list separated by this character.
+        raise ConfigError(f"{what} must not contain {os.pathsep!r}")
+    return resolved
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    return a == b or a in b.parents or b in a.parents
+
+
+def _check_send_dirs_apart(cfg: Config) -> None:
+    """The outbox and staging directory must not share space with data the server reads or writes elsewhere."""
+    assert cfg.send_file_dir is not None and cfg.send_staging_dir is not None
+    protected: list[tuple[str, Path]] = []
+    for view in cfg.account_views():
+        for what, path in (("a store directory", view.store_dir), ("a media directory", view.media_dir)):
+            if path is not None:
+                protected.append((what, path.resolve()))
+    for what, path in (("a media directory", cfg.media_dir), ("the download directory", cfg.download_dir)):
+        if path is not None:
+            protected.append((what, path.resolve()))
+    for name, directory in (
+        ("WACLI_MCP_SEND_FILE_DIR", cfg.send_file_dir),
+        ("WACLI_MCP_SEND_STAGING_DIR", cfg.send_staging_dir),
+    ):
+        for what, path in protected:
+            if _overlaps(directory, path):
+                raise ConfigError(f"{name} must not equal, contain, or be inside {what}")
+        if cfg.audit_log is not None:
+            log = cfg.audit_log.parent.resolve() / cfg.audit_log.name
+            if directory in log.parents:
+                raise ConfigError(f"{name} must not contain the audit log")
+
+
+def _auto_media_dir(store_dir: Path | None) -> Path | None:
+    """The store's own media directory, if it has one that passes the checks.
+
+    Auto-detected, so a bad directory only disables media; it must not stop the text tools.
+    """
+    if store_dir is None:
+        return None
+    try:
+        # Inside the try: on Python 3.12 is_dir() raises PermissionError for a store without search permission.
+        if not (store_dir / "media").is_dir():
+            return None
+        return _media_dir(store_dir / "media", "store media directory")
+    except (ConfigError, OSError, RuntimeError) as exc:
+        logging.getLogger("wacli_mcp").warning("media access disabled: %s", exc)
+        return None
+
+
 def probe_network_isolation(unshare: Path) -> bool:
     """Return True if an unprivileged empty network namespace can be created."""
     try:
@@ -201,6 +379,15 @@ class Config:
     # Command prefix that puts every wacli call in an empty network namespace.
     # Empty tuple means no isolation.
     sandbox_prefix: tuple[str, ...] = ()
+    # Directory get_group_media reads already-downloaded files from; None disables it.
+    media_dir: Path | None = None
+    # 3 MiB keeps the base64 form below the 5 MB per-image limit of common model APIs.
+    max_media_bytes: int = 3 * 1024 * 1024
+    allow_media_download: bool = False
+    download_dir: Path | None = None
+    max_download_dir_bytes: int = 1024 * 1024 * 1024
+    # Caps the size of the file a download child may write.
+    prlimit_bin: Path = Path("/usr/bin/prlimit")
     # Sending (off unless WACLI_MCP_ENABLE_SEND=1 and recipients are configured).
     send_enabled: bool = False
     send_recipients: tuple[tuple[str, str], ...] = ()  # (alias, JID) pairs
@@ -208,6 +395,11 @@ class Config:
     send_max_chars: int = 1000
     send_per_hour: int = 10
     send_timeout_s: float = 60.0
+    # File sending (off unless WACLI_MCP_ENABLE_SEND_FILES=1 on top of sending).
+    send_files_enabled: bool = False
+    send_file_dir: Path | None = None  # the outbox: the only place files can be sent from
+    send_staging_dir: Path | None = None  # where the approved snapshot is written for wacli and the daemon
+    send_file_max_bytes: int = 16 * 1024 * 1024
     # Multi-account mode: one view per account, each a copy of this config with
     # that account's store, chat policy and recipients. Empty in single-account mode.
     alias: str = DEFAULT_ALIAS
@@ -296,6 +488,28 @@ class Config:
         if allowed & denied:
             raise ConfigError("a JID cannot be both allowed and denied")
 
+        media_raw = env.get("WACLI_MCP_MEDIA_DIR", "").strip()
+        media_dir = _media_dir(Path(media_raw), "WACLI_MCP_MEDIA_DIR") if media_raw else _auto_media_dir(store_dir)
+
+        allow_raw = env.get("WACLI_MCP_ALLOW_MEDIA_DOWNLOAD", "").strip().lower()
+        if allow_raw not in ("", "0", "1", "false", "true"):
+            raise ConfigError("WACLI_MCP_ALLOW_MEDIA_DOWNLOAD must be 1 or 0")
+        allow_media_download = allow_raw in ("1", "true")
+        download_dir = None
+        if allow_media_download:
+            download_raw = env.get("WACLI_MCP_DOWNLOAD_DIR", "").strip()
+            if not download_raw:
+                raise ConfigError(
+                    "WACLI_MCP_ALLOW_MEDIA_DOWNLOAD=1 requires WACLI_MCP_DOWNLOAD_DIR (a private directory)"
+                )
+            download_dir = _private_dir(Path(download_raw), "WACLI_MCP_DOWNLOAD_DIR")
+            try:
+                prlimit_bin = validate_executable(Path(env.get("WACLI_MCP_PRLIMIT", "/usr/bin/prlimit")))
+            except ConfigError as exc:
+                raise ConfigError(f"media download needs prlimit to cap the file size: {exc}") from exc
+        else:
+            prlimit_bin = Path("/usr/bin/prlimit")
+
         audit_raw = env.get("WACLI_MCP_AUDIT_LOG", "").strip()
         audit_log = Path(audit_raw) if audit_raw else None
         if audit_log and not audit_log.is_absolute():
@@ -342,6 +556,21 @@ class Config:
             blocked = [jid for _, jid in send_recipients if not _chat_allowed(jid, allowed, denied)]
             if blocked:
                 raise ConfigError(f"send recipients hidden by the chat policy: {', '.join(blocked)}")
+        send_files = _flag(env, "WACLI_MCP_ENABLE_SEND_FILES")
+        send_file_dir = send_staging_dir = None
+        if send_files:
+            if not send_enabled:
+                raise ConfigError("WACLI_MCP_ENABLE_SEND_FILES=1 requires WACLI_MCP_ENABLE_SEND=1 and send recipients")
+            outbox_raw = env.get("WACLI_MCP_SEND_FILE_DIR", "").strip()
+            staging_raw = env.get("WACLI_MCP_SEND_STAGING_DIR", "").strip()
+            if not outbox_raw:
+                raise ConfigError("WACLI_MCP_ENABLE_SEND_FILES=1 requires WACLI_MCP_SEND_FILE_DIR (the outbox)")
+            if not staging_raw:
+                raise ConfigError(
+                    "WACLI_MCP_ENABLE_SEND_FILES=1 requires WACLI_MCP_SEND_STAGING_DIR (a private directory)"
+                )
+            send_file_dir = _media_dir(Path(outbox_raw), "WACLI_MCP_SEND_FILE_DIR")
+            send_staging_dir = _staging_dir(Path(staging_raw), send_file_dir, "WACLI_MCP_SEND_STAGING_DIR")
         confirmation = env.get("WACLI_MCP_SEND_CONFIRMATION", "elicit").strip().lower() or "elicit"
         if confirmation not in ("elicit", "none"):
             raise ConfigError("WACLI_MCP_SEND_CONFIRMATION must be elicit or none")
@@ -360,18 +589,41 @@ class Config:
             denied_chats=denied,
             audit_log=audit_log,
             sandbox_prefix=sandbox_prefix,
+            media_dir=media_dir,
+            max_media_bytes=_int(env, "WACLI_MCP_MAX_MEDIA_BYTES", 3 * 1024 * 1024, 64 * 1024, 64 * 1024 * 1024),
+            allow_media_download=allow_media_download,
+            download_dir=download_dir,
+            prlimit_bin=prlimit_bin,
+            max_download_dir_bytes=_int(
+                env, "WACLI_MCP_MAX_DOWNLOAD_DIR_BYTES", 1024 * 1024 * 1024, 1024 * 1024, 100 * 1024 * 1024 * 1024
+            ),
             send_enabled=send_enabled,
             send_recipients=send_recipients,
             send_confirmation=confirmation,  # type: ignore[arg-type]
             send_max_chars=_int(env, "WACLI_MCP_SEND_MAX_CHARS", 1000, 1, 4096),
             send_per_hour=_int(env, "WACLI_MCP_SEND_PER_HOUR", 10, 1, 60),
             send_timeout_s=_float(env, "WACLI_MCP_SEND_TIMEOUT_S", 60.0, 10.0, 300.0),
+            send_files_enabled=send_files,
+            send_file_dir=send_file_dir,
+            send_staging_dir=send_staging_dir,
+            send_file_max_bytes=_int(env, "WACLI_MCP_SEND_FILE_MAX_BYTES", 16 * 1024 * 1024, 1024, 100 * 1024 * 1024),
         )
         if not accounts_file:
+            if send_files:
+                _check_send_dirs_apart(base)
             return base
         views = load_accounts_file(Path(accounts_file), base, send_switch=send_enabled, env=env)
         # The top level keeps no store or policy of its own: every call goes through a view.
-        return replace(base, alias="", send_enabled=any(v.send_enabled for v in views), accounts=views)
+        cfg = replace(
+            base,
+            alias="",
+            send_enabled=any(v.send_enabled for v in views),
+            send_files_enabled=base.send_files_enabled and any(v.send_enabled for v in views),
+            accounts=views,
+        )
+        if send_files:
+            _check_send_dirs_apart(cfg)
+        return cfg
 
 
 _ACCOUNT_KEYS = frozenset({"store", "wacli_account", "label", "allowed_chats", "denied_chats", "send"})
@@ -520,11 +772,14 @@ def load_accounts_file(
                 label=label,
                 store_dir=store_dir,
                 account=None,
+                # Each account serves only the media of its own store.
+                media_dir=_auto_media_dir(store_dir),
                 allowed_chats=allowed,
                 denied_chats=denied,
                 # Both switches are needed: the environment enables sending, the file says to whom.
                 send_enabled=send_switch and bool(recipients),
                 send_recipients=recipients if send_switch else (),
+                send_files_enabled=base.send_files_enabled and send_switch and bool(recipients),
                 accounts=(),
             )
         )
