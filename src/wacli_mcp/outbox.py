@@ -13,6 +13,7 @@ import hashlib
 import io
 import os
 import stat
+import struct
 import unicodedata
 import zipfile
 from dataclasses import dataclass
@@ -186,7 +187,17 @@ def _sniff(head: bytes) -> str | None:
 
 
 def _check_ooxml(data: bytes, directory: str) -> None:
-    """Look at the zip directory only: nothing is extracted or decompressed."""
+    """Look at the zip directory only: nothing is extracted or decompressed.
+
+    The end-of-central-directory record is read by hand first, so an archive claiming a huge entry count
+    is refused before zipfile builds its in-memory index of it."""
+    tail = data[-(65535 + 22) :]
+    at = tail.rfind(b"PK\x05\x06")
+    if at < 0 or at + 22 > len(tail):
+        raise ToolError("the file is not a valid Office document")
+    disk_entries, entries, size, offset = struct.unpack_from("<HHII", tail, at + 8)
+    if 0xFFFF in (disk_entries, entries) or 0xFFFFFFFF in (size, offset) or entries > MAX_ZIP_ENTRIES:
+        raise ToolError("the file is not a valid Office document")
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = zf.namelist()
