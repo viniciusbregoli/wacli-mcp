@@ -10,11 +10,13 @@ here.
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import ipaddress
 import json
 import logging
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -171,6 +173,65 @@ def validate_executable(path: Path, *, sha256: str | None = None) -> Path:
     return resolved
 
 
+def _group_is_private(gid: int) -> bool:
+    """True when `gid` is the current user's primary group and nobody else belongs to it."""
+    me = pwd.getpwuid(os.getuid())
+    if gid != me.pw_gid:
+        return False
+    try:
+        members = grp.getgrgid(gid).gr_mem
+    except KeyError:
+        members = []
+    if any(member != me.pw_name for member in members):
+        return False
+    return not any(user.pw_gid == gid and user.pw_uid != os.getuid() for user in pwd.getpwall())
+
+
+def _check_ancestors(path: Path, what: str) -> None:
+    """Every parent of a trusted directory must be trusted too, or its owner could be swapped after startup.
+
+    A parent may be writable by the user's own private group (such as ~/.local, mode 775) and may be
+    world-writable only with the sticky bit (such as /tmp).
+    """
+    try:
+        for parent in path.parents:
+            st = parent.stat()
+            if st.st_uid not in (os.getuid(), 0):
+                raise ConfigError(
+                    f"{what} {path}: parent {parent} is owned by uid {st.st_uid}, expected the current user or root"
+                )
+            if st.st_mode & stat.S_ISVTX:
+                # Sticky and owned by root or us: others can add entries but cannot rename or delete ours.
+                continue
+            if st.st_mode & stat.S_IWOTH:
+                raise ConfigError(f"{what} {path}: parent {parent} is writable by others")
+            if st.st_mode & stat.S_IWGRP and not _group_is_private(st.st_gid):
+                raise ConfigError(f"{what} {path}: parent {parent} is writable by a group that has other members")
+    except OSError as exc:
+        raise ConfigError(f"{what} {path}: a parent directory cannot be checked: {exc.strerror}") from exc
+
+
+def _private_dir(path: Path, what: str) -> Path:
+    """Vet a directory only the current user may use and return its resolved form."""
+    if not path.is_absolute():
+        raise ConfigError(f"{what} must be absolute")
+    if not path.is_dir():
+        raise ConfigError(f"{what} does not exist or is not a directory: {path}")
+    resolved = path.resolve(strict=True)
+    st = resolved.stat()
+    if st.st_uid != os.getuid():
+        raise ConfigError(f"{what} {resolved} must be owned by the current user")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ConfigError(
+            f"{what} {resolved} is writable by group or others and "
+            "must not be accessible by group or others (chmod 700)"
+        )
+    if st.st_mode & 0o077:
+        raise ConfigError(f"{what} {resolved} must not be accessible by group or others (chmod 700)")
+    _check_ancestors(resolved, what)
+    return resolved
+
+
 def _media_dir(path: Path, what: str) -> Path:
     """Vet the directory media files are served from and return its resolved form."""
     if not path.is_absolute():
@@ -180,21 +241,13 @@ def _media_dir(path: Path, what: str) -> Path:
     resolved = path.resolve(strict=True)
     # Another local user who can write here could plant files for the server to hand out.
     _check_not_writable_by_others(resolved, what)
+    _check_ancestors(resolved, what)
     return resolved
 
 
 def _staging_dir(path: Path, outbox: Path, what: str) -> Path:
     """Vet the private directory approved file snapshots are written to and return its resolved form."""
-    if not path.is_absolute():
-        raise ConfigError(f"{what} must be absolute")
-    if not path.is_dir():
-        raise ConfigError(f"{what} does not exist or is not a directory: {path}")
-    resolved = path.resolve(strict=True)
-    st = resolved.stat()
-    if st.st_uid != os.getuid():
-        raise ConfigError(f"{what} {resolved} must be owned by the current user")
-    if st.st_mode & 0o077:
-        raise ConfigError(f"{what} {resolved} must not be accessible by group or others (chmod 700)")
+    resolved = _private_dir(path, what)
     if resolved == outbox or outbox in resolved.parents or resolved in outbox.parents:
         raise ConfigError(f"{what} must not be the outbox, inside it, or contain it")
     if os.pathsep in str(resolved):
@@ -405,7 +458,7 @@ class Config:
                 raise ConfigError(
                     "WACLI_MCP_ALLOW_MEDIA_DOWNLOAD=1 requires WACLI_MCP_DOWNLOAD_DIR (a private directory)"
                 )
-            download_dir = _media_dir(Path(download_raw), "WACLI_MCP_DOWNLOAD_DIR")
+            download_dir = _private_dir(Path(download_raw), "WACLI_MCP_DOWNLOAD_DIR")
             try:
                 prlimit_bin = validate_executable(Path(env.get("WACLI_MCP_PRLIMIT", "/usr/bin/prlimit")))
             except ConfigError as exc:
