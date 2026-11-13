@@ -201,6 +201,10 @@ def _check_ooxml(data: bytes, directory: str) -> None:
     # The count alone does not bound what zipfile parses: it reads every record in the declared directory size.
     # Walk at most `entries` record headers and require that they end exactly at the end record.
     end = len(data) - len(tail) + at
+    # zipfile reads a ZIP64 locator found just before the end record, markers or not, and then trusts its sizes.
+    # ZIP64 is never needed within the size cap, so a locator there is refused (it can hide in an entry comment).
+    if end >= 20 and data[end - 20 : end - 16] == b"PK\x06\x07":
+        raise ToolError("the file is not a valid Office document")
     pos = end - size
     if pos < 0:
         raise ToolError("the file is not a valid Office document")

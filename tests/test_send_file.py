@@ -1316,3 +1316,22 @@ def test_a_central_directory_longer_than_its_end_record_claims_is_refused_unopen
     monkeypatch.setattr(outbox.zipfile, "ZipFile", forbidden)
     with pytest.raises(ToolError, match="not a valid Office document"):
         outbox.load(outbox_dir, "short.docx", 1 << 20)
+
+
+def test_a_zip64_locator_hidden_in_the_last_entry_comment_is_refused_unopened(dirs, monkeypatch):
+    # zipfile honours a ZIP64 locator right before the end record even without 0xFFFF markers.
+    outbox_dir, _ = dirs
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<xml/>")
+        last = zipfile.ZipInfo("word/document.xml")
+        last.comment = b"PK\x06\x07" + b"\x00" * 16
+        zf.writestr(last, "<xml/>")
+    write(outbox_dir, "zip64.docx", buf.getvalue())
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("zipfile.ZipFile must not be constructed")
+
+    monkeypatch.setattr(outbox.zipfile, "ZipFile", forbidden)
+    with pytest.raises(ToolError, match="not a valid Office document"):
+        outbox.load(outbox_dir, "zip64.docx", 1 << 20)
