@@ -10,9 +10,11 @@ Refusal messages never contain local paths.
 """
 
 import hashlib
+import io
 import os
 import stat
 import unicodedata
+import zipfile
 from dataclasses import dataclass
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -56,6 +58,12 @@ _OOXML_MIMES = frozenset({_DOCX, _XLSX, _PPTX})
 _MEDIA_SNIFFED = frozenset({"image/jpeg", "image/png", "image/webp", "video/mp4"})
 _ZIP = "application/zip"
 
+# Not Z* or Cf, yet they render as blanks, so a name could look empty or like another name.
+_BLANKS = frozenset(map(chr, (0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x180E)))
+MAX_ZIP_ENTRIES = 10_000
+# What an Office document must hold besides [Content_Types].xml.
+_OOXML_DIRS = {_DOCX: "word/", _XLSX: "xl/", _PPTX: "ppt/"}
+
 ALLOWED_TYPES = "JPEG, PNG, WebP, MP4, MP3, OGG/Opus, M4A, PDF, TXT, CSV, MD, DOCX, XLSX, PPTX"
 
 
@@ -74,7 +82,11 @@ class OutboxFile:
 
 
 def _unprintable(text: str) -> bool:
-    return any(unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co") for ch in text)
+    for ch in text:
+        category = unicodedata.category(ch)
+        if category in ("Cc", "Cf", "Cs", "Co") or ch in _BLANKS or (category.startswith("Z") and ch != " "):
+            return True
+    return False
 
 
 def validate_path(value: object) -> tuple[str, ...]:
@@ -125,6 +137,11 @@ def read_outbox_file(outbox: str | os.PathLike[str], parts: tuple[str, ...], max
         st = os.fstat(file_fd)
         if not stat.S_ISREG(st.st_mode):
             raise ToolError("file is not a regular file")
+        # A second name for the inode could be an alias of a file from outside the outbox.
+        if st.st_nlink != 1:
+            raise ToolError("file has more than one hard link")
+        if st.st_uid not in (os.getuid(), 0):
+            raise ToolError("file is not owned by the server's user")
         if st.st_size == 0:
             raise ToolError("file is empty")
         if st.st_size > max_bytes:
@@ -168,6 +185,19 @@ def _sniff(head: bytes) -> str | None:
     return None
 
 
+def _check_ooxml(data: bytes, directory: str) -> None:
+    """Look at the zip directory only: nothing is extracted or decompressed."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+    except (zipfile.BadZipFile, ValueError, OSError, RuntimeError):
+        raise ToolError("the file is not a valid Office document") from None
+    if len(names) > MAX_ZIP_ENTRIES or "[Content_Types].xml" not in names:
+        raise ToolError("the file is not a valid Office document")
+    if not any(name.startswith(directory) for name in names):
+        raise ToolError("the file is not a valid Office document")
+
+
 def classify(name: str, data: bytes) -> tuple[str, str, str]:
     """Return (mime, wacli kind, extension) when name and content agree on an allowed type."""
     ext = os.path.splitext(name)[1].lower()
@@ -188,6 +218,8 @@ def classify(name: str, data: bytes) -> tuple[str, str, str]:
     matches = declared[0] in _OOXML_MIMES if sniffed == _ZIP else declared[0] == sniffed
     if not matches:
         raise ToolError("the file extension does not match the file content")
+    if sniffed == _ZIP:
+        _check_ooxml(data, _OOXML_DIRS[declared[0]])
     return declared[0], declared[1], ext
 
 
