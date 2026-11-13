@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from mcp.server import MCPServer
-from mcp.server.mcpserver import Elicit, Resolve
+from mcp.server.mcpserver import Context, Elicit, Resolve
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
@@ -226,17 +226,25 @@ class _Sender:
 
 
 async def _deliver(
-    sender: _Sender, key: str, record: dict[str, Any], send: Callable[[], Awaitable[Any]]
+    sender: _Sender,
+    key: str,
+    record: dict[str, Any],
+    send: Callable[[], Awaitable[Any]],
+    scrub: Callable[[str], str] = str,
 ) -> dict[str, Any]:
-    """Reserve the send slot, run the wacli write and report its outcome. Shared by every send tool."""
+    """Reserve the send slot, run the wacli write and report its outcome. Shared by every send tool.
+
+    `scrub` cleans wacli's error text before it is shown to the model."""
     sender.limiter.check()
     # Reserved before the first await, so an identical call running concurrently is refused by its
     # preflight. It stays reserved unless the send definitely failed, including on cancellation.
     sender.guard.record(key)
+    # Until the send reports back, a cancellation leaves the outcome unknown, and the audit must say so.
+    record["outcome"] = "uncertain"
     try:
         data = await send()
     except WacliError as exc:
-        if exc.kind == "timeout" or any(marker in str(exc) for marker in UNCERTAIN_MARKERS):
+        if exc.kind in ("timeout", "output_limit") or any(marker in str(exc) for marker in UNCERTAIN_MARKERS):
             record["outcome"] = "uncertain"
             raise ToolError(
                 "the send outcome is unknown: it may have been delivered. Do not retry; "
@@ -244,7 +252,7 @@ async def _deliver(
             ) from exc
         sender.guard.forget(key)
         record["outcome"] = "failed"
-        raise ToolError(f"not sent: {exc}") from exc
+        raise ToolError(f"not sent: {scrub(str(exc))}") from exc
     data = data if isinstance(data, dict) else {}
     record["outcome"] = "sent" if data.get("sent") else "unconfirmed"
     return data
@@ -299,8 +307,8 @@ def register_send_tool(
             raise ToolError("sending needs `wacli sync --follow` running for the configured store; nothing was sent")
         return sender, alias, jid, message
 
-    def rejected(tool: str, account: str) -> dict[str, Any]:
-        record: dict[str, Any] = {"tool": tool, "outcome": "rejected", "stage": "preflight"}
+    def rejected(tool: str, account: str, stage: str = "preflight") -> dict[str, Any]:
+        record: dict[str, Any] = {"tool": tool, "outcome": "rejected", "stage": stage}
         if multi and account in senders:
             record["account"] = account
         return record
@@ -345,7 +353,11 @@ def register_send_tool(
         approved: Annotated[SendApproval, Resolve(approval)],
     ) -> dict[str, Any]:
         started = time.monotonic()
-        sender, alias, jid, message = preflight(account, recipient, text)
+        try:
+            sender, alias, jid, message = preflight(account, recipient, text)
+        except ToolError:
+            audit(rejected("send_message", account, "send"))
+            raise
         record: dict[str, Any] = {"tool": "send_message", "recipient": alias, "chars": len(message)}
         if multi:
             record["account"] = account
@@ -387,15 +399,17 @@ def register_send_tool(
         outbox_dir, staging_dir, max_bytes = cfg.send_file_dir, cfg.send_staging_dir, cfg.send_file_max_bytes
         remove_stale_snapshots(staging_dir, max_age_s=max(600.0, 4 * cfg.send_timeout_s))
         # Digest of the file shown to the user for each argument set, so the send can prove it is the same file.
-        shown: OrderedDict[str, str] = OrderedDict()
+        # Keyed by the request too, so one call's prompt can never vouch for another call's bytes.
+        shown: OrderedDict[tuple, str] = OrderedDict()
+        reads = asyncio.Semaphore(2)
         file_confirm_note = (
             "The user must confirm the file's name, type, size and checksum before it is sent. "
             if cfg.send_confirmation == "elicit"
             else ""
         )
 
-        def shown_key(account: str, alias: str, file: str, caption: str) -> str:
-            return hashlib.sha256("\0".join((account, alias, file, caption)).encode()).hexdigest()
+        def shown_key(ctx: Context, account: str, alias: str, file: str, caption: str) -> tuple:
+            return (id(ctx.session), ctx.request_id, account, alias, file, caption)
 
         async def file_preflight(
             account: str, recipient: str, file: str, caption: str | None
@@ -404,7 +418,9 @@ def register_send_tool(
             sender = sender_for(account)
             alias, jid = target(sender, recipient)
             text = validate_message(caption, cfg.send_max_chars) if caption else ""
-            snapshot = await asyncio.to_thread(outbox.load, outbox_dir, file, max_bytes)
+            # Bounded before anything is consumed: each load can hold a full-size file in memory.
+            async with reads:
+                snapshot = await asyncio.to_thread(outbox.load, outbox_dir, file, max_bytes)
             if text and snapshot.kind == "audio":
                 raise ToolError("audio files cannot have a caption")
             if not sender.limiter.would_allow():
@@ -419,7 +435,7 @@ def register_send_tool(
             return sender, alias, jid, snapshot, text, key
 
         async def ask_file(
-            account: str, recipient: str, file: str, caption: str | None
+            ctx: Context, account: str, recipient: str, file: str, caption: str | None
         ) -> SendApproval | Elicit[SendApproval]:
             try:
                 _, alias, jid, snapshot, text, _ = await file_preflight(account, recipient, file, caption)
@@ -428,7 +444,7 @@ def register_send_tool(
                 raise
             if cfg.send_confirmation == "none":
                 return SendApproval(approve=True)
-            key = shown_key(account, alias, file, text)
+            key = shown_key(ctx, account, alias, file, text)
             shown[key] = snapshot.sha256
             shown.move_to_end(key)
             while len(shown) > SHOWN_DIGESTS:
@@ -440,16 +456,16 @@ def register_send_tool(
         if multi:
 
             async def file_approval(
-                account: str, recipient: str, file: str, caption: str | None = None
+                ctx: Context, account: str, recipient: str, file: str, caption: str | None = None
             ) -> SendApproval | Elicit[SendApproval]:
-                return await ask_file(account, recipient, file, caption)
+                return await ask_file(ctx, account, recipient, file, caption)
 
         else:
 
             async def file_approval(
-                recipient: str, file: str, caption: str | None = None
+                ctx: Context, recipient: str, file: str, caption: str | None = None
             ) -> SendApproval | Elicit[SendApproval]:
-                return await ask_file(views[0].alias, recipient, file, caption)
+                return await ask_file(ctx, views[0].alias, recipient, file, caption)
 
         @mcp.tool(
             title="Send WhatsApp file",
@@ -467,13 +483,18 @@ def register_send_tool(
             account: Account,
             recipient: Annotated[str, Field(description=recipient_help)],
             file: Annotated[str, Field(description="Path of the file relative to the outbox, such as 'report.pdf'")],
+            ctx: Context,
             approved: Annotated[SendApproval, Resolve(file_approval)],
             caption: Annotated[
                 str | None, Field(description=f"Optional caption, at most {cfg.send_max_chars} characters")
             ] = None,
         ) -> dict[str, Any]:
             started = time.monotonic()
-            sender, alias, jid, snapshot, text, key = await file_preflight(account, recipient, file, caption)
+            try:
+                sender, alias, jid, snapshot, text, key = await file_preflight(account, recipient, file, caption)
+            except ToolError:
+                audit(rejected("send_file", account, "send"))
+                raise
             record: dict[str, Any] = {
                 "tool": "send_file",
                 "recipient": alias,
@@ -483,6 +504,8 @@ def register_send_tool(
             if multi:
                 record["account"] = account
             staged = staging_dir / (secrets.token_hex(16) + snapshot.ext)
+            my_key = shown_key(ctx, account, alias, file, text)
+            stage_task: list[asyncio.Future] = []
             try:
                 if not approved.approve:
                     record["outcome"] = "declined"
@@ -492,16 +515,15 @@ def register_send_tool(
                         "recipient": alias,
                         "reason": "the user did not approve this file",
                     }
-                if (
-                    cfg.send_confirmation == "elicit"
-                    and shown.get(shown_key(account, alias, file, text)) != snapshot.sha256
-                ):
+                if cfg.send_confirmation == "elicit" and shown.get(my_key) != snapshot.sha256:
                     record["outcome"] = "changed"
                     raise ToolError("the file changed after it was shown for confirmation; nothing was sent")
 
                 async def run() -> Any:
+                    # A task, shielded: cancelling this call must not abandon a thread that is still writing.
+                    stage_task.append(asyncio.ensure_future(asyncio.to_thread(_stage, staged, snapshot.data)))
                     try:
-                        await asyncio.to_thread(_stage, staged, snapshot.data)
+                        await asyncio.shield(stage_task[0])
                     except OSError:
                         raise WacliError("the file could not be staged for sending") from None
                     args = [
@@ -521,7 +543,13 @@ def register_send_tool(
                         args, target=sender.view, extra_env={"WACLI_MEDIA_ROOTS": str(staging_dir)}
                     )
 
-                data = await _deliver(sender, key, record, run)
+                def scrub(message: str) -> str:
+                    # wacli quotes the paths it was given; none of them may reach the model.
+                    for path, label in ((str(staged), "<staging>"), (str(staging_dir), "<staging>")):
+                        message = message.replace(path, label)
+                    return message.replace(staged.name, "<staging>").replace(snapshot.name, "<file>")
+
+                data = await _deliver(sender, key, record, run, scrub)
                 result: dict[str, Any] = {
                     **({"account": account} if multi else {}),
                     "sent": bool(data.get("sent")),
@@ -538,6 +566,14 @@ def register_send_tool(
                     result["store_warning"] = "sent, but recording it in the local archive failed; do not resend"
                 return result
             finally:
+                shown.pop(my_key, None)
+                if stage_task and not stage_task[0].done():
+                    try:
+                        await asyncio.wait(stage_task)
+                    except asyncio.CancelledError:
+                        pass
+                if stage_task and stage_task[0].done() and not stage_task[0].cancelled():
+                    stage_task[0].exception()  # retrieved, so an unreported error is not logged
                 _unstage(staged)
                 record["ms"] = round((time.monotonic() - started) * 1000)
                 record.setdefault("outcome", "rejected")
