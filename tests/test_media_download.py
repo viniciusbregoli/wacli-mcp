@@ -61,7 +61,8 @@ async def download(fake, downloads, args=None, **overrides):
 
 
 def leftovers(downloads: Path) -> list[str]:
-    return sorted(p.name for p in downloads.iterdir())
+    # The capacity lock file is permanent by design (unlinking a flock file races with other processes).
+    return sorted(p.name for p in downloads.iterdir() if p.name != ".capacity.lock")
 
 
 # --- configuration -----------------------------------------------------------------------------
@@ -495,3 +496,73 @@ async def test_rate_limit_during_download_keeps_its_message(fake, downloads):
 def test_instructions_never_claim_nothing_is_fetched_when_download_is_enabled(fake, downloads):
     assert "nothing is fetched from WhatsApp" not in build_server(cfg(fake, downloads)).instructions
     assert "nothing is fetched from WhatsApp" in build_server(fake.config()).instructions
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o750, 0o705])
+def test_download_dir_must_have_no_group_or_other_bits(fake, tmp_path, mode):
+    path = tmp_path / "open-read"
+    path.mkdir()
+    path.chmod(mode)
+    with pytest.raises(ConfigError, match="WACLI_MCP_DOWNLOAD_DIR .*must not be accessible by group or others"):
+        Config.from_env(env_for(fake, WACLI_MCP_ALLOW_MEDIA_DOWNLOAD="1", WACLI_MCP_DOWNLOAD_DIR=str(path)))
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root owns everything it creates")
+def test_download_dir_must_be_owned_by_the_current_user(tmp_path, monkeypatch):
+    path = tmp_path / "mine"
+    path.mkdir(mode=0o700)
+    from wacli_mcp import config
+
+    monkeypatch.setattr(config.os, "getuid", lambda: 12345)
+    with pytest.raises(ConfigError, match="must be owned by the current user"):
+        config._private_dir(path, "WACLI_MCP_DOWNLOAD_DIR")
+
+
+def test_a_media_dir_may_still_be_readable_by_others(fake, tmp_path):
+    path = tmp_path / "readable"
+    path.mkdir()
+    path.chmod(0o755)
+    assert Config.from_env(env_for(fake, WACLI_MCP_MEDIA_DIR=str(path))).media_dir == path.resolve()
+
+
+def test_a_leftover_part_file_does_not_block_saving(tmp_path):
+    from wacli_mcp import media
+
+    (tmp_path / ".x.jpg.part").write_bytes(b"killed process")
+    media.save_new_file(tmp_path, "x.jpg", JPEG)
+    assert (tmp_path / "x.jpg").read_bytes() == JPEG
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".x.jpg.part", "x.jpg"]
+    with pytest.raises(media.AlreadySaved):
+        media.save_new_file(tmp_path, "x.jpg", MP4)
+    assert (tmp_path / "x.jpg").read_bytes() == JPEG
+
+
+def test_unique_part_files_are_still_swept_when_stale(tmp_path):
+    from wacli_mcp import media
+
+    old = tmp_path / ".x.jpg.0123456789abcdef.part"
+    old.write_bytes(b"partial")
+    os.utime(old, (1, 1))
+    media.remove_stale(tmp_path, max_age_s=60)
+    assert not old.exists()
+
+
+async def test_the_final_capacity_check_uses_the_real_size_and_saves_nothing(fake, downloads):
+    # The declared length fits; the bytes wacli produced do not.
+    fake.respond_download(show(length=JPEG_LENGTH), {"a.jpg": JPEG + b"\x00" * 2000})
+    result = await download(fake, downloads, max_download_dir_bytes=1000)
+    assert result.is_error and "download directory is full" in result.content[0].text
+    assert leftovers(downloads) == []
+
+
+async def test_capacity_lock_file_is_private_and_ignored_by_cleanup(fake, downloads):
+    from wacli_mcp import media
+
+    fake.respond_download(show(), {"a.jpg": JPEG})
+    result = await download(fake, downloads)
+    assert not result.is_error, result.content
+    lock = downloads / ".capacity.lock"
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    os.utime(lock, (1, 1))
+    media.remove_stale(downloads, max_age_s=60)
+    assert lock.exists()

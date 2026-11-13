@@ -900,6 +900,7 @@ def test_stale_snapshots_are_removed_at_startup_and_fresh_ones_are_kept(fake, di
 # Review fixes
 
 
+@pytest.mark.skipif(os.getuid() == 0, reason="root passes the ownership rule")
 def test_files_owned_by_someone_else_are_refused(fake, dirs, monkeypatch):
     from wacli_mcp import outbox as outbox_module
 
@@ -1138,3 +1139,143 @@ def test_m4a_that_is_not_provably_audio_only_is_refused(data):
 
 def test_an_mp4_video_is_still_a_video():
     assert outbox.classify("a.mp4", iso(b"isom", [b"vide", b"soun"]))[:2] == ("video/mp4", "video")
+
+
+@pytest.mark.parametrize(
+    "scenario", [{"stdout": "not json at all"}, {"stdout": "", "rc": 1}, {"stdout": "boom", "rc": 2}]
+)
+async def test_a_reply_without_an_envelope_is_uncertain_for_files_too(fake, daemon, dirs, scenario):
+    outbox, staging = dirs
+    write(outbox, "a.png", PNG)
+    fake.scenario(**scenario)
+    server = build_server(file_config(fake, dirs))
+    async with Client(server, elicitation_callback=User()) as client:
+        first = await client.call_tool("send_file", {"recipient": "ada", "file": "a.png"})
+        retry = await client.call_tool("send_file", {"recipient": "ada", "file": "a.png"})
+    assert first.is_error and "outcome is unknown" in text_of(first)
+    assert retry.is_error and "same file was already sent" in text_of(retry)
+    assert len(fake.calls()) == 1 and staged_leftovers(staging) == []
+
+
+def _office_zip_with_claimed_entries(count: int) -> bytes:
+    data = bytearray(ooxml("word/document.xml"))
+    eocd = data.rindex(b"PK\x05\x06")
+    data[eocd + 8 : eocd + 12] = count.to_bytes(2, "little") * 2
+    return bytes(data)
+
+
+@pytest.mark.parametrize("count", [10_001, 20_000, 0xFFFF])
+def test_the_zip_directory_is_not_opened_when_it_claims_too_many_entries(dirs, monkeypatch, count):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from wacli_mcp import outbox as outbox_module
+
+    outbox, _ = dirs
+    write(outbox, "claims.docx", _office_zip_with_claimed_entries(count))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("zipfile.ZipFile must not be constructed")
+
+    monkeypatch.setattr(outbox_module.zipfile, "ZipFile", forbidden)
+    with pytest.raises(ToolError, match="not a valid Office document"):
+        outbox_module.load(outbox, "claims.docx", 1 << 20)
+
+
+def test_zip64_markers_and_a_missing_end_record_are_refused_without_opening(dirs, monkeypatch):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from wacli_mcp import outbox as outbox_module
+
+    outbox, _ = dirs
+    data = bytearray(ooxml("word/document.xml"))
+    eocd = data.rindex(b"PK\x05\x06")
+    zip64 = bytearray(data)
+    zip64[eocd + 12 : eocd + 16] = b"\xff\xff\xff\xff"
+    write(outbox, "zip64.docx", bytes(zip64))
+    write(outbox, "noeocd.docx", bytes(data[:eocd]))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("zipfile.ZipFile must not be constructed")
+
+    monkeypatch.setattr(outbox_module.zipfile, "ZipFile", forbidden)
+    for name in ("zip64.docx", "noeocd.docx"):
+        with pytest.raises(ToolError, match="not a valid Office document"):
+            outbox_module.load(outbox, name, 1 << 20)
+
+
+async def test_only_one_send_holds_a_snapshot_at_a_time(fake, daemon, dirs, monkeypatch):
+    import threading
+    import time
+
+    from wacli_mcp import sending
+
+    outbox, _ = dirs
+    write(outbox, "a.png", PNG)
+    fake.respond(SENT)
+    lock, state = threading.Lock(), {"held": 0, "peak": 0}
+    real_stage, real_unstage = sending._stage, sending._unstage
+
+    def stage(path, data):
+        with lock:
+            state["held"] += 1
+            state["peak"] = max(state["peak"], state["held"])
+        time.sleep(0.1)
+        real_stage(path, data)
+
+    def unstage(path):
+        real_unstage(path)
+        with lock:
+            state["held"] -= 1
+
+    monkeypatch.setattr(sending, "_stage", stage)
+    monkeypatch.setattr(sending, "_unstage", unstage)
+    server = build_server(file_config(fake, dirs, send_confirmation="none", send_per_hour=60))
+    async with Client(server) as client:
+        results = await asyncio.gather(
+            *(
+                client.call_tool("send_file", {"recipient": "ada", "file": "a.png", "caption": f"c{i}"})
+                for i in range(4)
+            )
+        )
+    assert not any(r.is_error for r in results), [text_of(r) for r in results]
+    assert state["peak"] == 1
+
+
+async def test_a_cancelled_load_keeps_its_permit_until_its_thread_ends(fake, daemon, dirs, monkeypatch):
+    import threading
+
+    from wacli_mcp import outbox as outbox_module
+
+    outbox, _ = dirs
+    write(outbox, "a.png", PNG)
+    release, lock, started = threading.Event(), threading.Lock(), []
+    real = outbox_module.load
+
+    def blocked(*args):
+        with lock:
+            started.append(1)
+        release.wait(10)
+        return real(*args)
+
+    monkeypatch.setattr(outbox_module, "load", blocked)
+    server = build_server(file_config(fake, dirs, send_confirmation="none", send_per_hour=60))
+    async with Client(server) as client:
+
+        def call(i):
+            return asyncio.ensure_future(
+                client.call_tool("send_file", {"recipient": "ada", "file": "a.png", "caption": f"c{i}"})
+            )
+
+        first, second = call(0), call(1)
+        for _ in range(200):
+            if len(started) == 2:
+                break
+            await asyncio.sleep(0.025)
+        assert len(started) == 2
+        first.cancel()
+        await asyncio.sleep(0.1)
+        third = call(2)
+        await asyncio.sleep(0.4)
+        assert len(started) == 2, "a third load started while two threads were still reading"
+        release.set()
+        await asyncio.gather(first, second, third, return_exceptions=True)

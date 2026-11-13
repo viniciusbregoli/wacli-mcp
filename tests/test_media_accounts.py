@@ -224,7 +224,10 @@ async def test_multi_account_download_prefixes_the_alias_and_keeps_accounts_apar
     work = await call(cfg, "download_group_media", {"account": "work", "chat": GROUP, "message_id": MSG})
     assert work.structured_content["saved_as"] == f"work.{stem}.{MSG}.jpg"
     assert work.structured_content["downloaded"] is True
-    assert sorted(p.name for p in downloads.iterdir()) == [f"personal.{stem}.{MSG}.jpg", f"work.{stem}.{MSG}.jpg"]
+    assert sorted(p.name for p in downloads.iterdir() if p.name != ".capacity.lock") == [
+        f"personal.{stem}.{MSG}.jpg",
+        f"work.{stem}.{MSG}.jpg",
+    ]
 
     # A repeat for the same account is served from its own copy without network access.
     again = await call(cfg, "download_group_media", {"account": "work", "chat": GROUP, "message_id": MSG})

@@ -130,3 +130,25 @@ async def test_spawn_failure_is_a_safe_error(fake):
     with pytest.raises(WacliError, match="could not start wacli") as info:
         await runner.run(["doctor"])
     assert info.value.kind == "spawn_error"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "message"),
+    [
+        ({"stdout": "plain text, no json"}, "not a JSON envelope"),
+        ({"stdout": "", "rc": 3}, "exited with status 3"),
+        ({"stdout": "oops", "rc": 1}, "exited with status 1"),
+    ],
+)
+async def test_missing_envelope_is_a_protocol_error(fake, scenario, message):
+    fake.scenario(**scenario)
+    with pytest.raises(WacliError, match=message) as info:
+        await WacliRunner(fake.config()).run(["doctor"])
+    assert info.value.kind == "protocol"
+
+
+async def test_an_error_envelope_keeps_its_kind_and_text(fake):
+    fake.scenario(stdout=json.dumps({"success": False, "data": None, "error": "not authenticated"}), rc=1)
+    with pytest.raises(WacliError, match="^not authenticated$") as info:
+        await WacliRunner(fake.config()).run(["doctor"])
+    assert info.value.kind == "wacli_error"
