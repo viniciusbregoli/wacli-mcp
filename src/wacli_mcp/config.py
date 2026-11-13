@@ -236,9 +236,12 @@ def _auto_media_dir(store_dir: Path | None) -> Path | None:
 
     Auto-detected, so a bad directory only disables media; it must not stop the text tools.
     """
-    if store_dir is None or not (store_dir / "media").is_dir():
+    if store_dir is None:
         return None
     try:
+        # Inside the try: on Python 3.12 is_dir() raises PermissionError for a store without search permission.
+        if not (store_dir / "media").is_dir():
+            return None
         return _media_dir(store_dir / "media", "store media directory")
     except (ConfigError, OSError, RuntimeError) as exc:
         logging.getLogger("wacli_mcp").warning("media access disabled: %s", exc)

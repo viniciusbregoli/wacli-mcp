@@ -63,6 +63,18 @@ def test_unusable_auto_detected_media_dir_disables_media(fake, tmp_path):
     assert Config.from_env(env_for(fake, WACLI_MCP_STORE=str(store))).media_dir is None
 
 
+def test_store_that_cannot_be_searched_disables_media_instead_of_failing(fake, tmp_path):
+    # Probing <store>/media raises PermissionError on Python 3.12 when the store has no search permission.
+    store = tmp_path / "store"
+    store.mkdir(mode=0o700)
+    (store / "media").mkdir(mode=0o700)
+    store.chmod(0o600)
+    try:
+        assert Config.from_env(env_for(fake, WACLI_MCP_STORE=str(store))).media_dir is None
+    finally:
+        store.chmod(0o700)
+
+
 def test_media_size_limit_is_bounded(fake):
     # 3 MiB keeps base64 below the 5 MB per-image limit of common model APIs.
     assert Config.from_env(env_for(fake)).max_media_bytes == 3 * 1024 * 1024
