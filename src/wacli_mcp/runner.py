@@ -8,7 +8,7 @@ import os
 import signal
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .config import Config
@@ -20,6 +20,8 @@ MAX_ERROR_CHARS = 300
 # Environment variables passed to wacli. Everything else (API keys, tokens,
 # WACLI_STORE_DIR overrides) is dropped so the child sees only what it needs.
 PASSTHROUGH_ENV = ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "TZ")
+# Extra variables a write call may set. WACLI_MEDIA_ROOTS confines `send file --file` to a directory.
+WRITE_EXTRA_ENV = frozenset({"WACLI_MEDIA_ROOTS"})
 
 
 class WacliError(Exception):
@@ -104,7 +106,7 @@ class WacliRunner:
         argv.extend(args)
         return argv
 
-    def build_env(self, *, write: bool = False) -> dict[str, str]:
+    def build_env(self, *, write: bool = False, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         env = {
             "HOME": str(self.cfg.home),
             "PATH": "/usr/bin:/bin",
@@ -116,6 +118,10 @@ class WacliRunner:
         for key in PASSTHROUGH_ENV:
             if key in os.environ:
                 env[key] = os.environ[key]
+        if extra:
+            if not write or not set(extra) <= WRITE_EXTRA_ENV:
+                raise WacliError("this environment variable cannot be set for this call", kind="policy")
+            env.update(extra)
         return env
 
     async def run(
@@ -137,14 +143,18 @@ class WacliRunner:
             stdout, stderr, returncode = await self._spawn(argv, self.build_env(), self.cfg.timeout_s)
         return self._parse(stdout, stderr, returncode)
 
-    async def run_write(self, args: Sequence[str], target: Config | None = None) -> Any:
+    async def run_write(
+        self, args: Sequence[str], target: Config | None = None, *, extra_env: Mapping[str, str] | None = None
+    ) -> Any:
         """Run one wacli write command. Callers own authorization, confirmation and rate limits.
 
         Never retried: a send that timed out may still have been delivered.
         """
         async with self._write_lock:
             stdout, stderr, returncode = await self._spawn(
-                self.build_argv(args, write=True, target=target), self.build_env(write=True), self.cfg.send_timeout_s
+                self.build_argv(args, write=True, target=target),
+                self.build_env(write=True, extra=extra_env),
+                self.cfg.send_timeout_s,
             )
         return self._parse(stdout, stderr, returncode)
 
