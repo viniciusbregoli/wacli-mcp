@@ -192,6 +192,7 @@ def shape_doctor(data: Any, cfg) -> dict[str, Any]:
                 {
                     "send_recipients": [alias for alias, _ in cfg.send_recipients],
                     "send_confirmation": cfg.send_confirmation,
+                    "send_any_recipient": cfg.send_any_recipient,
                     "send_per_hour": cfg.send_per_hour,
                     "send_files_enabled": cfg.send_files_enabled,
                     **({"send_file_max_bytes": cfg.send_file_max_bytes} if cfg.send_files_enabled else {}),

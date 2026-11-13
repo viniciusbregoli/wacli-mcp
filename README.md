@@ -2,7 +2,8 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant search and read a
 WhatsApp archive mirrored locally by [wacli](https://github.com/openclaw/wacli), and, only if you opt in, send plain
-text to a short list of recipients you name.
+text to a short list of recipients you name. A second opt-in allows other numbers, each send approved by you in a
+prompt.
 
 By default it is read-only. It never edits, deletes, reacts, marks as read, back-fills history, or links an
 account; those code paths do not exist here. Photos and videos from group chats can be returned in two ways:
@@ -47,12 +48,12 @@ With sending enabled (see [Sending](#sending)) one more tool appears:
 
 | Tool | wacli command |
 | --- | --- |
-| `send_message` | `send text --to=<configured JID> --message=<text> --no-preview`, delegated to `wacli sync --follow` |
+| `send_message` | `send text --to=<recipient JID> --message=<text> --no-preview`, delegated to `wacli sync --follow` |
 
 It carries `readOnlyHint: false`, `idempotentHint: false` and `openWorldHint: true`.
 
 File sending (see [Sending files](#sending-files)) is a second opt-in that adds `send_file`, which sends one file
-from a directory you set aside (the outbox) with `send file --to=<configured JID> --file=<staged copy>`. It carries
+from a directory you set aside (the outbox) with `send file --to=<recipient JID> --file=<staged copy>`. It carries
 the same hints as `send_message`.
 
 With several accounts configured (see [Multiple accounts](#multiple-accounts)), every tool takes a required
@@ -65,7 +66,9 @@ steered by it ([Invariant Labs showed exactly this against a WhatsApp MCP server
 The layers, from outside in:
 
 1. **No write tools by default.** The exfiltration path in the Invariant Labs research was a `send_message` tool.
-   It does not exist unless you enable it, and then only reaches recipients you listed (see [Sending](#sending)).
+   It does not exist unless you enable it, and then only reaches recipients you listed (see [Sending](#sending)),
+   or, with a second opt-in, a number you approve in a prompt for that one send
+   (see [Sending to unlisted recipients](#sending-to-unlisted-recipients)).
    Pair this server with other tools that can send data out (email, web requests, shell) only with care, since a
    prompt injection read through this server could use them.
 2. **No network for wacli.** By default every wacli call runs inside an empty network namespace
@@ -175,6 +178,8 @@ Sending only (see [Sending](#sending)):
 | `WACLI_MCP_SEND_MAX_CHARS` | `1000` | Longest message accepted (1 to 4096) |
 | `WACLI_MCP_SEND_PER_HOUR` | `10` | Sends per rolling hour (1 to 60) |
 | `WACLI_MCP_SEND_TIMEOUT_S` | `60` | Time allowed for one send (10 to 300) |
+| `WACLI_MCP_SEND_ANY_RECIPIENT` | unset | `1` also allows numbers and JIDs outside the recipient list, each send approved by you (see [Sending to unlisted recipients](#sending-to-unlisted-recipients)) |
+| `WACLI_MCP_SEND_CONFIRM_CLIENTS` | unset | Required with the setting above: comma-separated MCP client names (`clientInfo.name`) you verified to show approval prompts to a person |
 
 File sending only (see [Sending files](#sending-files)):
 
@@ -226,6 +231,7 @@ allowed_chats = ["120363000000000001@g.us"]
 | `label` | Optional text shown to the model next to the alias |
 | `allowed_chats`, `denied_chats` | This account's chat policy (lists of JIDs) |
 | `send.recipients` | This account's only possible recipients, `alias = "JID"` |
+| `send.any_recipient` | `true` lets this account send to unlisted numbers too, with `WACLI_MCP_SEND_ANY_RECIPIENT=1`; `send.recipients` is then optional |
 
 How accounts are kept apart:
 
@@ -239,7 +245,10 @@ How accounts are kept apart:
   guard and the sync daemon check all belong to one account. A recipient alias or JID configured for one
   account is refused when sending from another.
 - **Two switches for sending.** The file says who each account may message, and `WACLI_MCP_ENABLE_SEND=1` in the
-  environment turns sending on. `send_message` only lists accounts that have recipients.
+  environment turns sending on. `send_message` only lists accounts that have recipients or `send.any_recipient`.
+  Unlisted recipients also need two switches: `send.any_recipient = true` for the account and
+  `WACLI_MCP_SEND_ANY_RECIPIENT=1` in the environment. An account without its own opt-in still refuses any number
+  outside its list.
 - **Files.** `WACLI_MCP_ENABLE_SEND_FILES=1` and its directories are global: one outbox and one staging directory
   serve every account that can send. Recipients, the hourly limit and the duplicate guard stay per account.
 - **Labelled results and audit.** Results and audit entries carry the account alias.
@@ -306,7 +315,7 @@ archive, so a message passes all of these, in order, before wacli is run:
 
 1. **Recipient allowlist.** `recipient` must be an alias from `WACLI_MCP_SEND_RECIPIENTS` or one of its exact
    JIDs. Names, phone numbers and other JIDs are refused, so a model (or a message it read) cannot pick a new
-   destination. Recipients must also be visible under the chat policy, or the server will not start.
+   destination (unless you opt in to [unlisted recipients](#sending-to-unlisted-recipients), approved one by one). Recipients must also be visible under the chat policy, or the server will not start.
 2. **Message checks.** Plain text up to `WACLI_MCP_SEND_MAX_CHARS`. Text with control or invisible characters
    (bidi overrides, zero-width spaces) is refused rather than cleaned, so what you approve is exactly what is sent.
    Lines starting with `-----` are refused because the confirmation prompt uses that frame.
@@ -402,6 +411,65 @@ claude mcp add whatsapp --scope user \
 
 `archive_health` reports `send_files_enabled` and `send_file_max_bytes` next to the other send settings.
 
+## Sending to unlisted recipients
+
+By default `send_message` and `send_file` only reach the recipient list. `WACLI_MCP_SEND_ANY_RECIPIENT=1` also lets
+`recipient` be a phone number in international format with its country code (such as `+5511912345678`; spaces,
+dashes, dots and parentheses are ignored, 8 to 15 digits, no leading 0) or a person or group JID. Every such send
+needs your approval in a prompt, and the server refuses before anything runs whenever it cannot tell that the prompt
+will reach a person.
+
+On top of the checks in [Sending](#sending) (and [Sending files](#sending-files) for files), an unlisted recipient
+must pass these:
+
+1. **Configuration.** The setting requires `WACLI_MCP_ENABLE_SEND=1`, keeps `WACLI_MCP_SEND_CONFIRMATION=elicit`
+   (startup fails with `none`) and requires `WACLI_MCP_SEND_CONFIRM_CLIENTS`. In single-account mode
+   `WACLI_MCP_SEND_RECIPIENTS` becomes optional. In multi-account mode each account opts in with
+   `send.any_recipient = true`.
+2. **A verified client.** The client must declare form elicitation when it connects, and its `clientInfo.name` must
+   be in `WACLI_MCP_SEND_CONFIRM_CLIENTS`. List only clients you have checked put elicitation prompts in front of a
+   person. A refused client name is written to the server's stderr so you can see what a client reports.
+3. **The whole prompt.** The prompt names the number with its `+`, the JID, and says it is not on the pre-approved
+   list. It must fit in 2000 UTF-16 code units, the length OpenBot shows, or the send is refused and the model is
+   told to shorten the text or caption. You never approve text you could not see.
+4. **Chat policy.** `allowed_chats` and `denied_chats` apply, so a hidden chat cannot be messaged.
+
+A number that matches a listed JID is treated as that alias, with the usual prompt. Unlisted sends share the hourly
+limit and the duplicate guard with every other send from that account. The audit log records `"<unlisted>"` as the
+recipient, never the number. The result returns the JID and `"unlisted": true`.
+
+Contact names are never used to pick or describe an unlisted recipient: names in the archive are third-party data,
+and the prompt shows only the number or JID. Check every digit before approving.
+
+### Clients and OpenBot
+
+The approval is an MCP form elicitation with one yes/no field, `approve`. Declining, cancelling or answering no
+sends nothing.
+
+OpenBot was checked by reading the code of the installed app on 2026-11-13, without sending anything:
+
+- OpenBot is not the MCP client. It hosts agents such as Codex or Claude, which connect to this server and forward
+  elicitation requests to OpenBot. This server therefore sees the agent's client name, not OpenBot's. The Codex
+  binary reports `codex-mcp-client`.
+- OpenBot shows a form elicitation as a prompt card in the app, one question per field, so `approve` becomes a
+  Yes/No question with the full prompt underneath. A skipped answer declines.
+- OpenBot answers on its own only Codex's field-less consent to run a tool, which this prompt is not.
+- In a messaging thread (WhatsApp, Telegram, Slack, Discord) OpenBot cancels elicitations, so an unlisted send asked
+  for from a chat is refused and nothing is sent. Use the OpenBot app.
+- OpenBot cuts prompt text at 2000 characters, which is where the prompt limit above comes from.
+
+Listing `codex-mcp-client` trusts every Codex session that reaches this server, including one run outside OpenBot.
+`clientInfo` is reported by the client itself, so this check stops a misconfigured client, not a hostile one; who
+can connect at all is still decided by the stdio launch or the HTTP bearer token.
+
+Example, for Codex under OpenBot over HTTP:
+
+```sh
+WACLI_MCP_ENABLE_SEND=1
+WACLI_MCP_SEND_ANY_RECIPIENT=1
+WACLI_MCP_SEND_CONFIRM_CLIENTS=codex-mcp-client
+```
+
 ## Keeping the archive fresh
 
 This server never syncs. Results describe what wacli has stored; message results (`list_messages`,
@@ -438,6 +506,9 @@ wacli's read commands work while `sync --follow` holds the store lock.
   tells the model not to retry and blocks the same file and caption for 10 minutes, as for text.
 - Delivery is not confirmed. A successful `send_message` means WhatsApp accepted the message, not that the
   recipient's phone received it.
+- An unlisted number is not checked against WhatsApp before the prompt. A number without WhatsApp fails at send time.
+- The client checks for unlisted recipients rely on what the client declares about itself. A client that declares
+  form elicitation and then answers prompts without a person defeats them; only list clients you have checked.
 - Without `WACLI_MCP_ALLOW_MEDIA_DOWNLOAD=1`, media is served only if it is already in the store's media
   directory. Files saved elsewhere (for example with `media download --output`) are refused by `get_group_media`.
 - A download needs outbound HTTPS from wacli to WhatsApp's media servers. The server cannot restrict that process
